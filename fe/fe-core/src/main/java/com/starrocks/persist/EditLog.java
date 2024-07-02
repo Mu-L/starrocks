@@ -95,7 +95,6 @@ import com.starrocks.scheduler.persist.TaskRunStatus;
 import com.starrocks.scheduler.persist.TaskRunStatusChange;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.LocalMetastore;
-import com.starrocks.server.RunMode;
 import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.staros.StarMgrJournal;
 import com.starrocks.staros.StarMgrServer;
@@ -140,7 +139,7 @@ public class EditLog {
         this.journalQueue = journalQueue;
     }
 
-    public static void loadJournal(GlobalStateMgr globalStateMgr, JournalEntity journal)
+    public void loadJournal(GlobalStateMgr globalStateMgr, JournalEntity journal)
             throws JournalInconsistentException {
         short opCode = journal.getOpCode();
         if (opCode != OperationType.OP_SAVE_NEXTID
@@ -171,12 +170,6 @@ public class EditLog {
                     } else if (opCode == OperationType.OP_DELETE_AUTO_INCREMENT_ID) {
                         metastore.replayDeleteAutoIncrementId(info);
                     }
-                    break;
-                }
-                case OperationType.OP_CREATE_DB: {
-                    Database db = (Database) journal.getData();
-                    LocalMetastore metastore = (LocalMetastore) globalStateMgr.getMetadata();
-                    metastore.replayCreateDb(db);
                     break;
                 }
                 case OperationType.OP_CREATE_DB_V2: {
@@ -217,7 +210,6 @@ public class EditLog {
                     globalStateMgr.getLocalMetastore().replayRenameDatabase(dbName, dbInfo.getNewDbName());
                     break;
                 }
-                case OperationType.OP_CREATE_TABLE:
                 case OperationType.OP_CREATE_TABLE_V2: {
                     CreateTableInfo info = (CreateTableInfo) journal.getData();
 
@@ -245,35 +237,12 @@ public class EditLog {
                     globalStateMgr.getLocalMetastore().replayDropTable(db, info.getTableId(), info.isForceDrop());
                     break;
                 }
-                case OperationType.OP_CREATE_MATERIALIZED_VIEW: {
-                    CreateTableInfo info = (CreateTableInfo) journal.getData();
-                    LOG.info("Begin to unprotect create materialized view. db = " + info.getDbName()
-                            + " create materialized view = " + info.getTable().getId()
-                            + " tableName = " + info.getTable().getName());
-                    globalStateMgr.getLocalMetastore().replayCreateTable(info);
-                    break;
-                }
                 case OperationType.OP_ADD_PARTITION_V2: {
                     PartitionPersistInfoV2 info = (PartitionPersistInfoV2) journal.getData();
                     LOG.info("Begin to unprotect add partition. db = " + info.getDbId()
                             + " table = " + info.getTableId()
                             + " partitionName = " + info.getPartition().getName());
                     globalStateMgr.getLocalMetastore().replayAddPartition(info);
-                    break;
-                }
-                case OperationType.OP_ADD_PARTITION: {
-                    PartitionPersistInfo info = (PartitionPersistInfo) journal.getData();
-                    LOG.info("Begin to unprotect add partition. db = " + info.getDbId()
-                            + " table = " + info.getTableId()
-                            + " partitionName = " + info.getPartition().getName());
-                    globalStateMgr.getLocalMetastore().replayAddPartition(info);
-                    break;
-                }
-                case OperationType.OP_ADD_PARTITIONS: {
-                    AddPartitionsInfo infos = (AddPartitionsInfo) journal.getData();
-                    for (PartitionPersistInfo info : infos.getAddPartitionInfos()) {
-                        globalStateMgr.getLocalMetastore().replayAddPartition(info);
-                    }
                     break;
                 }
                 case OperationType.OP_ADD_PARTITIONS_V2: {
@@ -296,6 +265,11 @@ public class EditLog {
                             + " table = " + info.getTableId()
                             + " partitionName = " + info.getPartitionName());
                     globalStateMgr.getLocalMetastore().replayDropPartition(info);
+                    break;
+                }
+                case OperationType.OP_DROP_PARTITIONS: {
+                    DropPartitionsInfo info = (DropPartitionsInfo) journal.getData();
+                    globalStateMgr.getLocalMetastore().replayDropPartitions(info);
                     break;
                 }
                 case OperationType.OP_MODIFY_PARTITION:
@@ -523,7 +497,7 @@ public class EditLog {
                 case OperationType.OP_BACKEND_STATE_CHANGE:
                 case OperationType.OP_BACKEND_STATE_CHANGE_V2: {
                     Backend be = (Backend) journal.getData();
-                    GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().updateBackendState(be);
+                    GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().updateInMemoryStateBackend(be);
                     break;
                 }
                 case OperationType.OP_ADD_FIRST_FRONTEND:
@@ -891,6 +865,9 @@ public class EditLog {
                         case SCHEMA_CHANGE:
                             globalStateMgr.getSchemaChangeHandler().replayRemoveAlterJobV2(log);
                             break;
+                        case OPTIMIZE:
+                            globalStateMgr.getSchemaChangeHandler().replayRemoveAlterJobV2(log);
+                            break;
                         default:
                             break;
                     }
@@ -1106,12 +1083,6 @@ public class EditLog {
                     globalStateMgr.getAuthenticationMgr().replayDropUser(userIdentity);
                     break;
                 }
-                case OperationType.OP_CREATE_SECURITY_INTEGRATION: {
-                    SecurityIntegrationInfo info = (SecurityIntegrationInfo) journal.getData();
-                    globalStateMgr.getAuthenticationMgr().replayCreateSecurityIntegration(
-                            info.name, info.propertyMap);
-                    break;
-                }
                 case OperationType.OP_UPDATE_ROLE_PRIVILEGE_V2: {
                     RolePrivilegeCollectionInfo info = (RolePrivilegeCollectionInfo) journal.getData();
                     globalStateMgr.getAuthorizationMgr().replayUpdateRolePrivilegeCollection(info);
@@ -1138,7 +1109,7 @@ public class EditLog {
                 }
                 case OperationType.OP_MODIFY_TABLE_ADD_OR_DROP_COLUMNS: {
                     final TableAddOrDropColumnsInfo info = (TableAddOrDropColumnsInfo) journal.getData();
-                    globalStateMgr.getSchemaChangeHandler().replayModifyTableAddOrDropColumns(info);
+                    globalStateMgr.getSchemaChangeHandler().replayModifyTableAddOrDrop(info);
                     break;
                 }
                 case OperationType.OP_SET_DEFAULT_STORAGE_VOLUME: {
@@ -1206,10 +1177,11 @@ public class EditLog {
                     globalStateMgr.getReplicationMgr().replayReplicationJob(replicationJobLog.getReplicationJob());
                     break;
                 }
-                case OperationType.OP_RECOVER_PARTITION_VERSION:
+                case OperationType.OP_RECOVER_PARTITION_VERSION: {
                     PartitionVersionRecoveryInfo info = (PartitionVersionRecoveryInfo) journal.getData();
                     GlobalStateMgr.getCurrentState().getMetaRecoveryDaemon().recoverPartitionVersion(info);
                     break;
+                }
                 default: {
                     if (Config.ignore_unknown_log_id) {
                         LOG.warn("UNKNOWN Operation Type {}", opCode);
@@ -1239,11 +1211,10 @@ public class EditLog {
      */
     private JournalTask submitLog(short op, Writable writable, long maxWaitIntervalMs) {
         long startTimeNano = System.nanoTime();
-        // do not check whether global state mgr is leader in non shared-nothing mode,
+        // do not check whether global state mgr is leader when writing star mgr journal,
         // because starmgr state change happens before global state mgr state change,
         // it will write log before global state mgr becomes leader
-        Preconditions.checkState(RunMode.getCurrentRunMode() != RunMode.SHARED_NOTHING ||
-                        GlobalStateMgr.getCurrentState().isLeader(),
+        Preconditions.checkState(op == OperationType.OP_STARMGR || GlobalStateMgr.getCurrentState().isLeader(),
                 "Current node is not leader, but " +
                         GlobalStateMgr.getCurrentState().getFeType() + ", submit log is not allowed");
         DataOutputBuffer buffer = new DataOutputBuffer(OUTPUT_BUFFER_INIT_SIZE);
@@ -1393,6 +1364,10 @@ public class EditLog {
 
     public void logDropPartition(DropPartitionInfo info) {
         logEdit(OperationType.OP_DROP_PARTITION, info);
+    }
+
+    public void logDropPartitions(DropPartitionsInfo info) {
+        logEdit(OperationType.OP_DROP_PARTITIONS, info);
     }
 
     public void logErasePartition(long partitionId) {
@@ -1876,6 +1851,10 @@ public class EditLog {
         logEdit(OperationType.OP_STARMGR, journal);
     }
 
+    public JournalTask logStarMgrOperationNoWait(StarMgrJournal journal) {
+        return submitLog(OperationType.OP_STARMGR, journal, -1);
+    }
+
     public void logCreateUser(
             UserIdentity userIdentity,
             UserAuthenticationInfo authenticationInfo,
@@ -1899,11 +1878,6 @@ public class EditLog {
 
     public void logDropUser(UserIdentity userIdentity) {
         logJsonObject(OperationType.OP_DROP_USER_V3, userIdentity);
-    }
-
-    public void logCreateSecurityIntegration(String name, Map<String, String> propertyMap) {
-        SecurityIntegrationInfo info = new SecurityIntegrationInfo(name, propertyMap);
-        logEdit(OperationType.OP_CREATE_SECURITY_INTEGRATION, info);
     }
 
     public void logUpdateUserPrivilege(
@@ -1964,7 +1938,7 @@ public class EditLog {
         logEdit(op, out -> Text.writeString(out, GsonUtils.GSON.toJson(obj)));
     }
 
-    public void logModifyTableAddOrDropColumns(TableAddOrDropColumnsInfo info) {
+    public void logModifyTableAddOrDrop(TableAddOrDropColumnsInfo info) {
         logEdit(OperationType.OP_MODIFY_TABLE_ADD_OR_DROP_COLUMNS, info);
     }
 

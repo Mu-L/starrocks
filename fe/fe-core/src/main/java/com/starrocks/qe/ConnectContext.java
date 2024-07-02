@@ -43,6 +43,7 @@ import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.util.TimeUtils;
+import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.http.HttpConnectContext;
 import com.starrocks.mysql.MysqlCapability;
 import com.starrocks.mysql.MysqlChannel;
@@ -61,6 +62,7 @@ import com.starrocks.server.MetadataMgr;
 import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.ast.CleanTemporaryTableStmt;
 import com.starrocks.sql.ast.SetListItem;
 import com.starrocks.sql.ast.SetStmt;
 import com.starrocks.sql.ast.SetType;
@@ -68,12 +70,14 @@ import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.SystemVariable;
 import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.ast.UserVariable;
+import com.starrocks.sql.optimizer.QueryMaterializationContext;
 import com.starrocks.sql.optimizer.dump.DumpInfo;
 import com.starrocks.sql.optimizer.dump.QueryDumpInfo;
 import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.thrift.TPipelineProfileLevel;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.thrift.TWorkGroup;
+import com.starrocks.warehouse.Warehouse;
 import org.apache.commons.collections4.MapUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -140,8 +144,6 @@ public class ConnectContext {
     protected volatile boolean isKilled;
     // Db
     protected String currentDb = "";
-    // warehouse
-    protected String currentWarehouse;
     // `qualifiedUser` is the user used when the user establishes connection and authentication.
     // It is the real user used for this connection.
     // Different from the `currentUserIdentity` authentication user of execute as,
@@ -195,13 +197,15 @@ public class ConnectContext {
     // isLastStmt is true when original stmt is single stmt
     //    or current processing stmt is the last stmt for multi stmts
     // used to set mysql result package
-    protected boolean isLastStmt;
+    protected boolean isLastStmt = true;
     // set true when user dump query through HTTP
     protected boolean isHTTPQueryDump = false;
 
     protected boolean isStatisticsConnection = false;
     protected boolean isStatisticsJob = false;
     protected boolean isStatisticsContext = false;
+
+    protected boolean isMetadataContext = false;
     protected boolean needQueued = true;
 
     protected DumpInfo dumpInfo;
@@ -223,6 +227,12 @@ public class ConnectContext {
     private boolean relationAliasCaseInsensitive = false;
 
     private final Map<String, PrepareStmtContext> preparedStmtCtxs = Maps.newHashMap();
+
+    private UUID sessionId;
+
+    // QueryMaterializationContext is different from MaterializationContext that it keeps the context during the query
+    // lifecycle instead of per materialized view.
+    private QueryMaterializationContext queryMVContext;
 
     public StmtExecutor getExecutor() {
         return executor;
@@ -270,6 +280,7 @@ public class ConnectContext {
         if (shouldDumpQuery()) {
             this.dumpInfo = new QueryDumpInfo(this);
         }
+        this.sessionId = UUIDUtil.genUUID();
     }
 
     public void putPreparedStmt(String stmtName, PrepareStmtContext ctx) {
@@ -424,6 +435,7 @@ public class ConnectContext {
     public Map<String, UserVariable> getUserVariables() {
         return userVariables;
     }
+
     public UserVariable getUserVariable(String variable) {
         return userVariables.get(variable);
     }
@@ -677,19 +689,30 @@ public class ConnectContext {
         this.sessionVariable.setCatalog(currentCatalog);
     }
 
-    public String getCurrentWarehouse() {
-        if (currentWarehouse != null) {
-            return currentWarehouse;
+    public long getCurrentWarehouseId() {
+        String warehouseName = this.sessionVariable.getWarehouseName();
+        if (warehouseName.equalsIgnoreCase(WarehouseManager.DEFAULT_WAREHOUSE_NAME)) {
+            return WarehouseManager.DEFAULT_WAREHOUSE_ID;
         }
-        return WarehouseManager.DEFAULT_WAREHOUSE_NAME;
+
+        Warehouse warehouse = globalStateMgr.getWarehouseMgr().getWarehouse(warehouseName);
+        if (warehouse == null) {
+            throw new SemanticException("Warehouse " + warehouseName + " not exist");
+        }
+        return warehouse.getId();
+    }
+
+    public String getCurrentWarehouseName() {
+        return this.sessionVariable.getWarehouseName();
     }
 
     public void setCurrentWarehouse(String currentWarehouse) {
-        this.currentWarehouse = currentWarehouse;
+        this.sessionVariable.setWarehouseName(currentWarehouse);
     }
 
-    public void setCurrentWarehouseId(long id) {
-        // not implemented in this codebase
+    public void setCurrentWarehouseId(long warehouseId) {
+        Warehouse warehouse = globalStateMgr.getWarehouseMgr().getWarehouse(warehouseId);
+        this.sessionVariable.setWarehouseName(warehouse.getName());
     }
 
     public void setParentConnectContext(ConnectContext parent) {
@@ -714,6 +737,14 @@ public class ConnectContext {
 
     public void setStatisticsContext(boolean isStatisticsContext) {
         this.isStatisticsContext = isStatisticsContext;
+    }
+
+    public boolean isMetadataContext() {
+        return isMetadataContext;
+    }
+
+    public void setMetadataContext(boolean metadataContext) {
+        isMetadataContext = metadataContext;
     }
 
     public boolean isNeedQueued() {
@@ -744,6 +775,23 @@ public class ConnectContext {
         return this.forwardTimes;
     }
 
+
+    public void setSessionId(UUID sessionId) {
+        this.sessionId = sessionId;
+    }
+
+    public UUID getSessionId() {
+        return this.sessionId;
+    }
+
+    public QueryMaterializationContext getQueryMVContext() {
+        return queryMVContext;
+    }
+
+    public void setQueryMVContext(QueryMaterializationContext queryMVContext) {
+        this.queryMVContext = queryMVContext;
+    }
+
     // kill operation with no protect.
     public void kill(boolean killConnection, String cancelledMessage) {
         LOG.warn("kill query, {}, kill connection: {}",
@@ -767,8 +815,7 @@ public class ConnectContext {
                         break;
                     }
                 } catch (InterruptedException e) {
-                    LOG.warn(e);
-                    LOG.warn("sleep exception, ignore.");
+                    LOG.warn("sleep exception, ignore.", e);
                     break;
                 }
             }
@@ -828,6 +875,10 @@ public class ConnectContext {
 
     public int getTotalBackendNumber() {
         return globalStateMgr.getNodeMgr().getClusterInfo().getTotalBackendNumber();
+    }
+
+    public int getAliveComputeNumber() {
+        return globalStateMgr.getNodeMgr().getClusterInfo().getAliveComputeNodeNumber();
     }
 
     public void setPending(boolean pending) {
@@ -959,6 +1010,26 @@ public class ConnectContext {
         }
 
         this.setDatabase(dbName);
+    }
+
+    public void cleanTemporaryTable() {
+        if (sessionId == null) {
+            return;
+        }
+        if (!GlobalStateMgr.getCurrentState().getTemporaryTableMgr().sessionExists(sessionId)) {
+            return;
+        }
+        LOG.debug("clean temporary table on session {}", sessionId);
+        try {
+            setQueryId(UUIDUtil.genUUID());
+            CleanTemporaryTableStmt cleanTemporaryTableStmt = new CleanTemporaryTableStmt(sessionId);
+            cleanTemporaryTableStmt.setOrigStmt(
+                    new OriginStatement("clean temporary table on session '" + sessionId.toString() + "'"));
+            executor = new StmtExecutor(this, cleanTemporaryTableStmt);
+            executor.execute();
+        } catch (Throwable e) {
+            LOG.warn("Failed to clean temporary table on session {}, {}", sessionId, e);
+        }
     }
 
     /**

@@ -73,8 +73,6 @@ public class HttpConnectProcessor extends ConnectProcessor {
         StatementBase parsedStmt = ((HttpConnectContext) ctx).getStatement();
         String sql = parsedStmt.getOrigStmt().originStmt;
 
-        addRunningQueryDetail(parsedStmt);
-
         executor = new StmtExecutor(ctx, parsedStmt);
         ctx.setExecutor(executor);
 
@@ -88,6 +86,7 @@ public class HttpConnectProcessor extends ConnectProcessor {
         }
 
         try {
+            executor.addRunningQueryDetail(parsedStmt);
             executor.execute();
         } catch (IOException e) {
             // Client failed.
@@ -120,12 +119,11 @@ public class HttpConnectProcessor extends ConnectProcessor {
         // We may need to find some way to resolve this.
         if (executor != null) {
             auditAfterExec(sql, executor.getParsedStmt(), executor.getQueryStatisticsForAuditLog());
+            executor.addFinishedQueryDetail();
         } else {
             // executor can be null if we encounter analysis error.
             auditAfterExec(sql, null, null);
         }
-
-        addFinishedQueryDetail();
     }
 
     @Override

@@ -51,6 +51,9 @@ import com.starrocks.catalog.Database;
 import com.starrocks.catalog.DiskInfo;
 import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
+import com.starrocks.catalog.MaterializedView;
+import com.starrocks.catalog.MvRefreshArbiter;
+import com.starrocks.catalog.MvUpdateInfo;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Replica;
@@ -77,6 +80,7 @@ import com.starrocks.ha.FrontendNodeType;
 import com.starrocks.journal.JournalEntity;
 import com.starrocks.journal.JournalInconsistentException;
 import com.starrocks.journal.JournalTask;
+import com.starrocks.lake.StarOSAgent;
 import com.starrocks.meta.MetaContext;
 import com.starrocks.persist.EditLog;
 import com.starrocks.planner.PlanFragment;
@@ -125,12 +129,11 @@ import com.starrocks.sql.plan.PlanFragmentBuilder;
 import com.starrocks.sql.plan.PlanTestBase;
 import com.starrocks.statistic.StatsConstants;
 import com.starrocks.system.Backend;
-import com.starrocks.system.BackendCoreStat;
+import com.starrocks.system.BackendResourceStat;
 import com.starrocks.system.ComputeNode;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.thrift.TResultSinkType;
 import com.starrocks.thrift.TUniqueId;
-import com.starrocks.warehouse.Warehouse;
 import mockit.Mock;
 import mockit.MockUp;
 import org.apache.commons.codec.binary.Hex;
@@ -199,6 +202,7 @@ public class UtFrameUtils {
         ctx.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
         ctx.setThreadLocalInfo();
         ctx.setDumpInfo(new MockDumpInfo());
+        ctx.setSessionId(UUIDUtil.genUUID());
         return ctx;
     }
 
@@ -352,10 +356,9 @@ public class UtFrameUtils {
         GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().addBackend(be);
         if (RunMode.isSharedDataMode()) {
             int starletPort = backend.getStarletPort();
-            Warehouse warehouse = GlobalStateMgr.getCurrentState().getWarehouseMgr().getDefaultWarehouse();
-            long workerGroupId = warehouse.getAnyAvailableCluster().getWorkerGroupId();
             String workerAddress = backend.getHost() + ":" + starletPort;
-            GlobalStateMgr.getCurrentState().getStarOSAgent().addWorker(be.getId(), workerAddress, workerGroupId);
+            GlobalStateMgr.getCurrentState().getStarOSAgent().addWorker(be.getId(), workerAddress,
+                    StarOSAgent.DEFAULT_WORKER_GROUP_ID);
         }
         return be;
     }
@@ -371,10 +374,9 @@ public class UtFrameUtils {
         GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().addComputeNode(cn);
         if (RunMode.isSharedDataMode()) {
             int starletPort = backend.getStarletPort();
-            Warehouse warehouse = GlobalStateMgr.getCurrentState().getWarehouseMgr().getDefaultWarehouse();
-            long workerGroupId = warehouse.getAnyAvailableCluster().getWorkerGroupId();
             String workerAddress = backend.getHost() + ":" + starletPort;
-            GlobalStateMgr.getCurrentState().getStarOSAgent().addWorker(cn.getId(), workerAddress, workerGroupId);
+            GlobalStateMgr.getCurrentState().getStarOSAgent().addWorker(cn.getId(), workerAddress,
+                    StarOSAgent.DEFAULT_WORKER_GROUP_ID);
         }
         return cn;
     }
@@ -523,6 +525,22 @@ public class UtFrameUtils {
         }
     }
 
+    public static String getFragmentPlan(ConnectContext connectContext, String sql, String traceModule) {
+        try {
+            Pair<String, Pair<ExecPlan, String>> result =
+                    UtFrameUtils.getFragmentPlanWithTrace(connectContext, sql, traceModule);
+            Pair<ExecPlan, String> execPlanWithQuery = result.second;
+            String traceLog = execPlanWithQuery.second;
+            if (!Strings.isNullOrEmpty(traceLog)) {
+                System.out.println(traceLog);
+            }
+            return execPlanWithQuery.first.getExplainString(TExplainLevel.NORMAL);
+        } catch (Exception e) {
+            Assert.fail(e.getMessage());
+            return null;
+        }
+    }
+
     public static Pair<String, Pair<ExecPlan, String>> getFragmentPlanWithTrace(
             ConnectContext connectContext, String sql, String module) throws Exception {
         if (Strings.isNullOrEmpty(module)) {
@@ -631,7 +649,7 @@ public class UtFrameUtils {
                     com.starrocks.sql.analyzer.Analyzer.analyze(viewStatement, connectContext);
                 } catch (Exception e) {
                     System.out.println("invalid view def: " + createTableStmt.getInlineViewDef()
-                            + "\nError msg:"  + e.getMessage());
+                            + "\nError msg:" + e.getMessage());
                     throw e;
                 }
             } catch (SemanticException | AnalysisException e) {
@@ -774,9 +792,9 @@ public class UtFrameUtils {
 
         // mock be core stat
         for (Map.Entry<Long, Integer> entry : replayDumpInfo.getNumOfHardwareCoresPerBe().entrySet()) {
-            BackendCoreStat.setNumOfHardwareCoresOfBe(entry.getKey(), entry.getValue());
+            BackendResourceStat.getInstance().setNumHardwareCoresOfBe(entry.getKey(), entry.getValue());
         }
-        BackendCoreStat.setCachedAvgNumOfHardwareCores(replayDumpInfo.getCachedAvgNumOfHardwareCores());
+        BackendResourceStat.getInstance().setCachedAvgNumHardwareCores(replayDumpInfo.getCachedAvgNumOfHardwareCores());
 
         // mock table row count
         for (Map.Entry<String, Map<String, Long>> entry : replayDumpInfo.getPartitionRowCountMap().entrySet()) {
@@ -848,6 +866,7 @@ public class UtFrameUtils {
         }
         return optimizedPlan;
     }
+
     public static OptExpression getQueryOptExpression(ConnectContext connectContext,
                                                       ColumnRefFactory columnRefFactory,
                                                       LogicalPlan logicalPlan) {
@@ -915,6 +934,16 @@ public class UtFrameUtils {
 
     public static void tearDownTestDump() {
         tearMockEnv();
+    }
+
+    public static ExecPlan getPlanFragmentFromQueryDump(ConnectContext connectContext, QueryDumpInfo dumpInfo)
+            throws Exception {
+        String q = initMockEnv(connectContext, dumpInfo);
+        try {
+            return UtFrameUtils.getPlanAndFragment(connectContext, q).second;
+        } finally {
+            tearMockEnv();
+        }
     }
 
     public static Pair<String, ExecPlan> getNewPlanAndFragmentFromDump(ConnectContext connectContext,
@@ -1132,7 +1161,7 @@ public class UtFrameUtils {
                 try (DataInputStream dis = new DataInputStream(
                         new ByteArrayInputStream(buffer.getData(), 0, buffer.getLength()))) {
                     je.readFields(dis);
-                    EditLog.loadJournal(GlobalStateMgr.getCurrentState(), je);
+                    GlobalStateMgr.getCurrentState().getEditLog().loadJournal(GlobalStateMgr.getCurrentState(), je);
                     // System.out.println("replayed journal type: " + je.getOpCode());
                 } catch (JournalInconsistentException e) {
                     System.err.println("load journal failed, type: " + je.getOpCode() + " , error: " + e.getMessage());
@@ -1198,6 +1227,29 @@ public class UtFrameUtils {
         }
     }
 
+    public static void mockTimelinessForAsyncMVTest(ConnectContext connectContext) {
+        new MockUp<MvRefreshArbiter>() {
+            /**
+             * {@link MvRefreshArbiter#getMVTimelinessUpdateInfo(MaterializedView, boolean)}
+             */
+            @Mock
+            public MvUpdateInfo getMVTimelinessUpdateInfo(MaterializedView mv,
+                                                          boolean isQueryRewrite) {
+                return new MvUpdateInfo(MvUpdateInfo.MvToRefreshType.NO_REFRESH);
+            }
+        };
+
+        new MockUp<UtFrameUtils>() {
+            /**
+             * {@link UtFrameUtils#isPrintPlanTableNames()}
+             */
+            @Mock
+            boolean isPrintPlanTableNames() {
+                return true;
+            }
+        };
+    }
+
     public static void setDefaultConfigForAsyncMVTest(ConnectContext connectContext) {
         Config.dynamic_partition_check_interval_seconds = 10;
         Config.bdbje_heartbeat_timeout_second = 60;
@@ -1221,6 +1273,10 @@ public class UtFrameUtils {
         // build a small cache for test
         Config.mv_plan_cache_max_size = 10;
 
+        // Since Config.default_mv_refresh_partition_num is set to 1 by default, if not set to -1 in FE UTs,
+        // task run will only refresh 1 partition and will produce wrong result.
+        Config.default_mv_partition_refresh_number = -1;
+
         FeConstants.enablePruneEmptyOutputScan = false;
         FeConstants.runningUnitTest = true;
 
@@ -1229,14 +1285,15 @@ public class UtFrameUtils {
             connectContext.getSessionVariable().setOptimizerExecuteTimeout(300 * 1000);
             // 300s: 5min
             connectContext.getSessionVariable().setOptimizerMaterializedViewTimeLimitMillis(300 * 1000);
-            // 300s: 5min
-            connectContext.getSessionVariable().setOptimizerMaterializedViewTimeLimitMillis(300 * 1000);
 
             connectContext.getSessionVariable().setEnableShortCircuit(false);
             connectContext.getSessionVariable().setEnableQueryCache(false);
             connectContext.getSessionVariable().setEnableLocalShuffleAgg(true);
             connectContext.getSessionVariable().setEnableLowCardinalityOptimize(true);
             connectContext.getSessionVariable().setUseLowCardinalityOptimizeV2(false);
+
+            // Disable text based rewrite by default.
+            connectContext.getSessionVariable().setEnableMaterializedViewTextMatchRewrite(false);
         }
 
         new MockUp<PlanTestBase>() {
@@ -1301,7 +1358,6 @@ public class UtFrameUtils {
         }
         context.getUserVariables().putAll(userVariablesFromHint);
     }
-
 
     private static void clearQueryScopeHintContext(ConnectContext context, SessionVariable sessionVariableBackup) {
         context.setSessionVariable(sessionVariableBackup);

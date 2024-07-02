@@ -57,6 +57,7 @@ import com.starrocks.persist.metablock.SRMetaBlockID;
 import com.starrocks.persist.metablock.SRMetaBlockReader;
 import com.starrocks.persist.metablock.SRMetaBlockWriter;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.thrift.TTransactionStatus;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.transaction.TransactionState.LoadJobSourceType;
@@ -138,9 +139,12 @@ public class GlobalTransactionMgr implements MemoryTrackable {
      * @throws DuplicatedRequestException
      * @throws IllegalTransactionParameterException
      */
+
+
     public long beginTransaction(long dbId, List<Long> tableIdList, String label, TUniqueId requestId,
                                  TxnCoordinator coordinator, LoadJobSourceType sourceType, long listenerId,
-                                 long timeoutSecond)
+                                 long timeoutSecond,
+                                 long warehouseId)
             throws LabelAlreadyUsedException, RunningTxnExceedException, DuplicatedRequestException, AnalysisException {
 
         if (Config.disable_load_job) {
@@ -172,7 +176,7 @@ public class GlobalTransactionMgr implements MemoryTrackable {
 
         DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(dbId);
         return dbTransactionMgr.beginTransaction(tableIdList, label, requestId, coordinator, sourceType, listenerId,
-                timeoutSecond);
+                timeoutSecond, warehouseId);
     }
 
     public long beginTransaction(long dbId, List<Long> tableIdList, String label, TxnCoordinator coordinator,
@@ -180,6 +184,22 @@ public class GlobalTransactionMgr implements MemoryTrackable {
                                  long timeoutSecond)
             throws AnalysisException, LabelAlreadyUsedException, RunningTxnExceedException, DuplicatedRequestException {
         return beginTransaction(dbId, tableIdList, label, null, coordinator, sourceType, -1, timeoutSecond);
+    }
+
+    public long beginTransaction(long dbId, List<Long> tableIdList, String label, TxnCoordinator coordinator,
+                                 LoadJobSourceType sourceType,
+                                 long timeoutSecond, long warehouseId)
+            throws AnalysisException, LabelAlreadyUsedException, RunningTxnExceedException, DuplicatedRequestException {
+        return beginTransaction(dbId, tableIdList, label, null, coordinator, sourceType, -1,
+                timeoutSecond, warehouseId);
+    }
+
+    public long beginTransaction(long dbId, List<Long> tableIdList, String label, TUniqueId requestId,
+                                 TxnCoordinator coordinator, LoadJobSourceType sourceType, long listenerId,
+                                 long timeoutSecond)
+            throws AnalysisException, LabelAlreadyUsedException, RunningTxnExceedException, DuplicatedRequestException {
+        return beginTransaction(dbId, tableIdList, label, requestId, coordinator, sourceType, listenerId, timeoutSecond,
+                WarehouseManager.DEFAULT_WAREHOUSE_ID);
     }
 
     private void checkValidTimeoutSecond(long timeoutSecond, int maxLoadTimeoutSecond, int minLoadTimeOutSecond)
@@ -287,7 +307,8 @@ public class GlobalTransactionMgr implements MemoryTrackable {
         List<Long> tableIdList = transactionState.getTableIdList();
 
         Locker locker = new Locker();
-        if (!locker.tryLockTablesWithIntensiveDbLock(db, tableIdList, LockType.WRITE, timeoutMillis)) {
+        if (!locker.tryLockTablesWithIntensiveDbLock(db, tableIdList, LockType.WRITE,
+                timeoutMillis, TimeUnit.MILLISECONDS)) {
             throw new UserException("get database write lock timeout, database="
                     + db.getFullName() + ", timeoutMillis=" + timeoutMillis);
         }
@@ -410,7 +431,7 @@ public class GlobalTransactionMgr implements MemoryTrackable {
         TransactionState transactionState = getTransactionState(db.getId(), transactionId);
         List<Long> tableId = transactionState.getTableIdList();
         Locker locker = new Locker();
-        if (!locker.tryLockTablesWithIntensiveDbLock(db, tableId, LockType.WRITE, timeoutMs)) {
+        if (!locker.tryLockTablesWithIntensiveDbLock(db, tableId, LockType.WRITE, timeoutMs, TimeUnit.MILLISECONDS)) {
             throw new LockTimeoutException(
                     "get database write lock timeout, database=" + db.getFullName() + ", timeout=" + timeoutMs + "ms");
         }

@@ -43,6 +43,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Range;
+import com.google.common.collect.Sets;
 import com.google.common.collect.Table.Cell;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.BrokerDesc;
@@ -55,6 +56,7 @@ import com.starrocks.backup.RestoreFileMapping.IdChain;
 import com.starrocks.backup.Status.ErrCode;
 import com.starrocks.backup.mv.MvRestoreContext;
 import com.starrocks.catalog.Column;
+import com.starrocks.catalog.ColumnId;
 import com.starrocks.catalog.DataProperty;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.FsBroker;
@@ -182,6 +184,9 @@ public class RestoreJob extends AbstractJob {
     protected com.google.common.collect.Table<Long, Long, SnapshotInfo> snapshotInfos = HashBasedTable.create();
 
     protected Map<Long, Long> unfinishedSignatureToId = Maps.newConcurrentMap();
+
+    // store some remote table ids that is skipped to restore, eg: mv is active in local db
+    protected Set<Long> skipRestoreRemoteTableIds = Sets.newHashSet();
 
     private MvRestoreContext mvRestoreContext;
 
@@ -526,6 +531,7 @@ public class RestoreJob extends AbstractJob {
                             // eg: we restore mv's data (old version) but not restore associated version map which may
                             // cause wrong result if it can be used to rewrite.
                             LOG.warn("Skip to restore existed and active mv: {}", mv.getName());
+                            skipRestoreRemoteTableIds.add(remoteTbl.getId());
                             continue;
                         }
                     }
@@ -826,6 +832,7 @@ public class RestoreJob extends AbstractJob {
         unfinishedSignatureToId.clear();
         taskProgress.clear();
         taskErrMsg.clear();
+        skipRestoreRemoteTableIds.clear();
         Multimap<Long, Long> bePathsMap = HashMultimap.create();
         batchTask = new AgentBatchTask();
         Locker locker = new Locker();
@@ -889,7 +896,7 @@ public class RestoreJob extends AbstractJob {
     }
 
     protected void createReplicas(OlapTable localTbl, Partition restorePart) {
-        Set<String> bfColumns = localTbl.getCopiedBfColumns();
+        Set<ColumnId> bfColumns = localTbl.getBfColumnIds();
         double bfFpp = localTbl.getBfFpp();
         for (PhysicalPartition physicalPartition : restorePart.getSubPartitions()) {
             for (MaterializedIndex restoredIdx : physicalPartition.getMaterializedIndices(IndexExtState.VISIBLE)) {
@@ -930,6 +937,7 @@ public class RestoreJob extends AbstractJob {
                                 .setPrimaryIndexCacheExpireSec(localTbl.primaryIndexCacheExpireSec())
                                 .setTabletType(localTbl.getPartitionInfo().getTabletType(restorePart.getId()))
                                 .setCompressionType(localTbl.getCompressionType())
+                                .setCompressionLevel(localTbl.getCompressionLevel())
                                 .setInRestoreMode(true)
                                 .setTabletSchema(tabletSchema)
                                 .build();
@@ -1151,6 +1159,7 @@ public class RestoreJob extends AbstractJob {
         unfinishedSignatureToId.clear();
         taskProgress.clear();
         taskErrMsg.clear();
+        skipRestoreRemoteTableIds.clear();
         batchTask = new AgentBatchTask();
         for (long dbId : dbToSnapshotInfos.keySet()) {
             List<SnapshotInfo> infos = dbToSnapshotInfos.get(dbId);
@@ -1335,6 +1344,7 @@ public class RestoreJob extends AbstractJob {
         unfinishedSignatureToId.clear();
         taskProgress.clear();
         taskErrMsg.clear();
+        skipRestoreRemoteTableIds.clear();
 
         prepareAndSendDirMoveTasks();
 
@@ -1439,6 +1449,10 @@ public class RestoreJob extends AbstractJob {
             try {
                 for (BackupTableInfo tblInfo : jobInfo.tables.values()) {
                     Table tbl = db.getTable(jobInfo.getAliasByOriginNameIfSet(tblInfo.name));
+                    // skip to restore table ids
+                    if (skipRestoreRemoteTableIds.contains(tblInfo.id)) {
+                        continue;
+                    }
                     if (tbl == null) {
                         LOG.warn("skip post actions after restore success, table name does not existed: %s",
                                 tblInfo.name);
@@ -1662,6 +1676,9 @@ public class RestoreJob extends AbstractJob {
 
     private void setTableStateToNormal(Database db) {
         for (BackupTableInfo tblInfo : jobInfo.tables.values()) {
+            if (skipRestoreRemoteTableIds.contains(tblInfo.id)) {
+                continue;
+            }
             Table tbl = db.getTable(jobInfo.getAliasByOriginNameIfSet(tblInfo.name));
             if (tbl == null) {
                 continue;
@@ -1740,64 +1757,6 @@ public class RestoreJob extends AbstractJob {
             for (Map.Entry<Long, SnapshotInfo> entry : map.entrySet()) {
                 out.writeLong(entry.getKey());
                 entry.getValue().write(out);
-            }
-        }
-    }
-
-    @Override
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-
-        backupTimestamp = Text.readString(in);
-        jobInfo = BackupJobInfo.read(in);
-        allowLoad = in.readBoolean();
-
-        state = RestoreJobState.valueOf(Text.readString(in));
-
-        if (in.readBoolean()) {
-            backupMeta = BackupMeta.read(in);
-        }
-
-        fileMapping = RestoreFileMapping.read(in);
-
-        metaPreparedTime = in.readLong();
-        snapshotFinishedTime = in.readLong();
-        downloadFinishedTime = in.readLong();
-
-        restoreReplicationNum = in.readInt();
-
-        int size = in.readInt();
-        for (int i = 0; i < size; i++) {
-            String tblName = Text.readString(in);
-            Partition part = Partition.read(in);
-            restoredPartitions.add(Pair.create(tblName, part));
-        }
-
-        size = in.readInt();
-        for (int i = 0; i < size; i++) {
-            restoredTbls.add(Table.read(in));
-        }
-
-        size = in.readInt();
-        for (int i = 0; i < size; i++) {
-            long tblId = in.readLong();
-            int innerSize = in.readInt();
-            for (int j = 0; j < innerSize; j++) {
-                long partId = in.readLong();
-                long version = in.readLong();
-                in.readLong(); // read a version_hash for compatibility
-                restoredVersionInfo.put(tblId, partId, version);
-            }
-        }
-
-        size = in.readInt();
-        for (int i = 0; i < size; i++) {
-            long tabletId = in.readLong();
-            int innerSize = in.readInt();
-            for (int j = 0; j < innerSize; j++) {
-                long beId = in.readLong();
-                SnapshotInfo info = SnapshotInfo.read(in);
-                snapshotInfos.put(tabletId, beId, info);
             }
         }
     }

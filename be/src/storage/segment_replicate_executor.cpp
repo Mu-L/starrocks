@@ -145,11 +145,16 @@ void ReplicateChannel::_send_request(SegmentPB* segment, butil::IOBuf& data, boo
     request.set_eos(eos);
     request.set_txn_id(_opt->txn_id);
     request.set_index_id(_opt->index_id);
+    request.set_sink_id(_opt->sink_id);
+
+    VLOG(1) << "Send segment to " << debug_string()
+            << " segment_id=" << (segment == nullptr ? -1 : segment->segment_id()) << " eos=" << eos
+            << " txn_id=" << _opt->txn_id << " index_id=" << _opt->index_id << " sink_id=" << _opt->sink_id;
 
     _closure->ref();
     _closure->reset();
     _closure->cntl.set_timeout_ms(_opt->timeout_ms);
-    _closure->cntl.ignore_eovercrowded();
+    SET_IGNORE_OVERCROWDED(_closure->cntl, load);
 
     if (segment != nullptr) {
         request.set_allocated_segment(segment);

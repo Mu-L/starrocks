@@ -96,6 +96,16 @@ Status TableFunctionTableSink::decompose_to_pipeline(pipeline::OpFactories prev_
     sink_ctx->compression_type = target_table.compression_type;
     sink_ctx->column_evaluators = ColumnExprEvaluator::from_exprs(output_exprs, runtime_state);
     sink_ctx->fragment_context = fragment_ctx;
+    if (target_table.__isset.csv_column_seperator) {
+        sink_ctx->options[formats::CSVWriterOptions::COLUMN_TERMINATED_BY] = target_table.csv_column_seperator;
+    }
+    if (target_table.__isset.csv_row_delimiter) {
+        sink_ctx->options[formats::CSVWriterOptions::LINE_TERMINATED_BY] = target_table.csv_row_delimiter;
+    }
+    if (target_table.__isset.parquet_use_legacy_encoding && target_table.parquet_use_legacy_encoding) {
+        sink_ctx->options[formats::ParquetWriterOptions::USE_LEGACY_DECIMAL_ENCODING] = "true";
+        sink_ctx->options[formats::ParquetWriterOptions::USE_INT96_TIMESTAMP_ENCODING] = "true";
+    }
 
     auto connector = connector::ConnectorManager::default_instance()->get(connector::Connector::FILE);
     auto sink_provider = connector->create_data_sink_provider();
@@ -105,7 +115,8 @@ Status TableFunctionTableSink::decompose_to_pipeline(pipeline::OpFactories prev_
     size_t sink_dop = target_table.write_single_file ? 1 : context->data_sink_dop();
     if (sink_ctx->partition_column_indices.empty()) {
         auto ops = context->maybe_interpolate_local_passthrough_exchange(
-                runtime_state, pipeline::Operator::s_pseudo_plan_node_id_for_final_sink, prev_operators, sink_dop);
+                runtime_state, pipeline::Operator::s_pseudo_plan_node_id_for_final_sink, prev_operators, sink_dop,
+                pipeline::LocalExchanger::PassThroughType::SCALE);
         ops.emplace_back(std::move(op));
         context->add_pipeline(std::move(ops));
 

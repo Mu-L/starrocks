@@ -110,9 +110,6 @@ public class TrinoFunctionTransformTest extends TrinoTestBase {
         String sql = "select to_unixtime(TIMESTAMP '2023-04-22 00:00:00');";
         assertPlanContains(sql, "1682092800");
 
-        sql = "select to_unixtime(cast('2023-12-05 23:28:46' as timestamp) at time zone 'Asia/Shanghai')";
-        analyzeFail(sql, "Time zone is not supported");
-
         sql = "select date_parse('2022/10/20/05', '%Y/%m/%d/%H');";
         assertPlanContains(sql, "2022-10-20 05:00:00");
 
@@ -443,5 +440,18 @@ public class TrinoFunctionTransformTest extends TrinoTestBase {
 
         sql = "select current_schema";
         assertPlanContains(sql, "<slot 2> : 'test'");
+    }
+
+
+    @Test
+    public void testHllFunction() throws Exception {
+        String sql = "select empty_approx_set()";
+        assertPlanContains(sql, "<slot 2> : HLL_EMPTY()");
+
+        sql = "select approx_set(\"tc\") from tall";
+        assertPlanContains(sql, "<slot 12> : hll_hash(CAST(3: tc AS VARCHAR))");
+
+        sql = "select merge(approx_set(\"tc\")) from tall";
+        assertPlanContains(sql, "hll_raw_agg(hll_hash(CAST(3: tc AS VARCHAR)))");
     }
 }

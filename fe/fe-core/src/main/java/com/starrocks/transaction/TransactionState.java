@@ -49,11 +49,10 @@ import com.starrocks.common.Config;
 import com.starrocks.common.TraceManager;
 import com.starrocks.common.UserException;
 import com.starrocks.common.io.Writable;
-import com.starrocks.common.util.concurrent.lock.LockType;
-import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.metric.MetricRepo;
 import com.starrocks.proto.TxnTypePB;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.service.FrontendOptions;
 import com.starrocks.system.Backend;
 import com.starrocks.task.PublishVersionTask;
@@ -158,7 +157,7 @@ public class TransactionState implements Writable {
                 case OFFSET_OUT_OF_RANGE:
                     return "Offset out of range";
                 case NO_PARTITIONS:
-                    return "all partitions have no load data";
+                    return "No partitions have data available for loading";
                 case FILTERED_ROWS:
                     return "too many filtered rows";
                 default:
@@ -248,6 +247,8 @@ public class TransactionState implements Writable {
     private long finishTime;
     @SerializedName("rs")
     private String reason = "";
+    @SerializedName("gtid")
+    private long globalTransactionId;
 
     // whether this txn is finished using new mechanism
     // this field needs to be persisted, so we shared the serialization field with `reason`.
@@ -260,6 +261,10 @@ public class TransactionState implements Writable {
     // error replica ids
     @SerializedName("er")
     private Set<Long> errorReplicas;
+
+    @SerializedName("ctl")
+    private boolean useCombinedTxnLog;
+
     private final CountDownLatch latch;
 
     // these states need not be serialized
@@ -307,6 +312,9 @@ public class TransactionState implements Writable {
     @SerializedName("ta")
     private TxnCommitAttachment txnCommitAttachment;
 
+    @SerializedName("wid")
+    private long warehouseId = WarehouseManager.DEFAULT_WAREHOUSE_ID;
+
     // this map should be set when load execution begin, so that when the txn commit, it will know
     // which tables and rollups it loaded.
     // tbl id -> (index ids)
@@ -322,7 +330,7 @@ public class TransactionState implements Writable {
     // used for PublishDaemon to check whether this txn can be published
     // not persisted, so need to rebuilt if FE restarts
     private volatile TransactionChecker finishChecker = null;
-    private long checkerCreationTime = 0;
+
     private Span txnSpan = null;
     private String traceParent = null;
     private Set<TabletCommitInfo> tabletCommitInfos = null;
@@ -336,13 +344,13 @@ public class TransactionState implements Writable {
     private final ReentrantReadWriteLock txnLock = new ReentrantReadWriteLock(true);
 
     public void writeLock() {
-        if (Config.lock_manager_enable_loading_using_fine_granularity_lock) {
+        if (Config.lock_manager_enable_using_fine_granularity_lock) {
             txnLock.writeLock().lock();
         }
     }
 
     public void writeUnlock() {
-        if (Config.lock_manager_enable_loading_using_fine_granularity_lock) {
+        if (Config.lock_manager_enable_using_fine_granularity_lock) {
             txnLock.writeLock().unlock();
         }
     }
@@ -472,6 +480,10 @@ public class TransactionState implements Writable {
         return transactionId;
     }
 
+    public long getGlobalTransactionId() {
+        return globalTransactionId;
+    }
+
     public String getLabel() {
         return this.label;
     }
@@ -510,6 +522,14 @@ public class TransactionState implements Writable {
 
     public long getTimeoutMs() {
         return timeoutMs;
+    }
+
+    public long getWarehouseId() {
+        return warehouseId;
+    }
+
+    public void setWarehouseId(long warehouseId) {
+        this.warehouseId = warehouseId;
     }
 
     public void setTransactionStatus(TransactionStatus transactionStatus) {
@@ -635,6 +655,10 @@ public class TransactionState implements Writable {
         return this.latch.await(timeout, unit);
     }
 
+    public void setGlobalTransactionId(long globalTransactionId) {
+        this.globalTransactionId = globalTransactionId;
+    }
+
     public void setPrepareTime(long prepareTime) {
         this.prepareTime = prepareTime;
     }
@@ -686,6 +710,11 @@ public class TransactionState implements Writable {
 
     public void setTxnCommitAttachment(TxnCommitAttachment txnCommitAttachment) {
         this.txnCommitAttachment = txnCommitAttachment;
+    }
+
+    public boolean isVersionOverwrite() {
+        return txnCommitAttachment instanceof InsertTxnCommitAttachment
+                && ((InsertTxnCommitAttachment) txnCommitAttachment).getIsVersionOverwrite();
     }
 
     // return true if txn is in final status and label is expired
@@ -849,6 +878,9 @@ public class TransactionState implements Writable {
         for (PartitionCommitInfo commitInfo : partitionCommitInfos) {
             TPartitionVersionInfo version = new TPartitionVersionInfo(commitInfo.getPartitionId(),
                     commitInfo.getVersion(), 0);
+            if (commitInfo.isDoubleWrite()) {
+                version.setIs_double_write(true);
+            }
             partitionVersions.add(version);
         }
 
@@ -856,6 +888,7 @@ public class TransactionState implements Writable {
         for (long backendId : publishBackends) {
             PublishVersionTask task = new PublishVersionTask(backendId,
                     this.getTransactionId(),
+                    this.getGlobalTransactionId(),
                     this.getDbId(),
                     commitTime,
                     partitionVersions,
@@ -864,7 +897,8 @@ public class TransactionState implements Writable {
                     createTime,
                     this,
                     Config.enable_sync_publish,
-                    this.getTxnType());
+                    this.getTxnType(),
+                    isVersionOverwrite());
             this.addPublishVersionTask(backendId, task);
             tasks.add(task);
         }
@@ -883,31 +917,18 @@ public class TransactionState implements Writable {
         return true;
     }
 
-    // Note: caller should hold db lock
-    public void prepareFinishChecker(Database db) {
-        synchronized (this) {
-            finishChecker = TransactionChecker.create(this, db);
-            checkerCreationTime = System.nanoTime();
-        }
-    }
-
     public boolean checkCanFinish() {
-        // finishChecker may be null if FE restarts
         // finishChecker may require refresh if table/partition is dropped, or index is changed caused by Alter job
-        if (finishChecker == null || System.nanoTime() - checkerCreationTime > 10000000000L) {
-            Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
-            if (db == null) {
-                // consider txn finished if db is dropped
-                return true;
-            }
-            Locker locker = new Locker();
-            locker.lockDatabase(db, LockType.READ);
-            try {
-                prepareFinishChecker(db);
-            } finally {
-                locker.unLockDatabase(db, LockType.READ);
-            }
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
+        if (db == null) {
+            // consider txn finished if db is dropped
+            return true;
         }
+
+        if (finishChecker == null) {
+            finishChecker = TransactionChecker.create(this, db);
+        }
+
         if (finishState == null) {
             finishState = new TxnFinishState();
         }
@@ -978,6 +999,14 @@ public class TransactionState implements Writable {
 
     public void setWriteDurationMs(long writeDurationMs) {
         this.writeDurationMs = writeDurationMs;
+    }
+
+    public void setUseCombinedTxnLog(boolean useCombinedTxnLog) {
+        this.useCombinedTxnLog = useCombinedTxnLog;
+    }
+
+    public boolean isUseCombinedTxnLog() {
+        return useCombinedTxnLog;
     }
 
     public ConcurrentMap<String, TOlapTablePartition> getPartitionNameToTPartition() {

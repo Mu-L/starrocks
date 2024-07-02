@@ -40,6 +40,7 @@ import com.starrocks.qe.QueryState;
 import com.starrocks.qe.StmtExecutor;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.StatementPlanner;
+import com.starrocks.sql.analyzer.AlterTableClauseAnalyzer;
 import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.AddPartitionClause;
@@ -219,7 +220,7 @@ public class InsertOverwriteJobRunner {
             throw new DmlException("database id:%s does not exist", dbId);
         }
         Locker locker = new Locker();
-        if (!locker.lockAndCheckExist(db, LockType.WRITE)) {
+        if (!locker.lockDatabaseAndCheckExist(db, LockType.WRITE)) {
             throw new DmlException("insert overwrite commit failed because locking db:%s failed", dbId);
         }
 
@@ -286,7 +287,7 @@ public class InsertOverwriteJobRunner {
         try {
             addPartitionClause = AnalyzerUtils.getAddPartitionClauseFromPartitionValues(olapTable, partitionValues);
         } catch (AnalysisException ex) {
-            LOG.warn(ex);
+            LOG.warn(ex.getMessage(), ex);
             throw new RuntimeException(ex);
         }
         GlobalStateMgr state = GlobalStateMgr.getCurrentState();
@@ -294,9 +295,11 @@ public class InsertOverwriteJobRunner {
         Database db = state.getDb(targetDb);
         List<Long> sourcePartitionIds = job.getSourcePartitionIds();
         try {
-            state.getLocalMetastore().addPartitions(db, olapTable.getName(), addPartitionClause);
+            AlterTableClauseAnalyzer analyzer = new AlterTableClauseAnalyzer(olapTable);
+            analyzer.analyze(context, addPartitionClause);
+            state.getLocalMetastore().addPartitions(context, db, olapTable.getName(), addPartitionClause);
         } catch (Exception ex) {
-            LOG.warn(ex);
+            LOG.warn(ex.getMessage(), ex);
             throw new RuntimeException(ex);
         }
         PartitionDesc partitionDesc = addPartitionClause.getPartitionDesc();
@@ -346,7 +349,7 @@ public class InsertOverwriteJobRunner {
             throw new DmlException("database id:%s does not exist", dbId);
         }
         Locker locker = new Locker();
-        if (!locker.lockAndCheckExist(db, LockType.READ)) {
+        if (!locker.lockDatabaseAndCheckExist(db, LockType.READ)) {
             throw new DmlException("insert overwrite commit failed because locking db:%s failed", dbId);
         }
         OlapTable targetTable;
@@ -356,7 +359,7 @@ public class InsertOverwriteJobRunner {
             locker.unLockDatabase(db, LockType.READ);
         }
         PartitionUtils.createAndAddTempPartitionsForTable(db, targetTable, postfix,
-                job.getSourcePartitionIds(), job.getTmpPartitionIds(), null);
+                job.getSourcePartitionIds(), job.getTmpPartitionIds(), null, job.getWarehouseId());
         createPartitionElapse = System.currentTimeMillis() - createPartitionStartTimestamp;
     }
 
@@ -368,7 +371,7 @@ public class InsertOverwriteJobRunner {
             throw new DmlException("database id:%s does not exist", dbId);
         }
         Locker locker = new Locker();
-        if (!locker.lockAndCheckExist(db, LockType.WRITE)) {
+        if (!locker.lockDatabaseAndCheckExist(db, LockType.WRITE)) {
             throw new DmlException("insert overwrite commit failed because locking db:%s failed", dbId);
         }
 
@@ -418,7 +421,7 @@ public class InsertOverwriteJobRunner {
             throw new DmlException("database id:%s does not exist", dbId);
         }
         Locker locker = new Locker();
-        if (!locker.lockAndCheckExist(db, LockType.WRITE)) {
+        if (!locker.lockDatabaseAndCheckExist(db, LockType.WRITE)) {
             throw new DmlException("insert overwrite commit failed because locking db:%s failed", dbId);
         }
         try {
@@ -482,7 +485,7 @@ public class InsertOverwriteJobRunner {
             throw new DmlException("database id:%s does not exist", dbId);
         }
         Locker locker = new Locker();
-        if (!locker.lockAndCheckExist(db, LockType.READ)) {
+        if (!locker.lockDatabaseAndCheckExist(db, LockType.READ)) {
             throw new DmlException("insert overwrite commit failed because locking db:%s failed", dbId);
         }
         try {

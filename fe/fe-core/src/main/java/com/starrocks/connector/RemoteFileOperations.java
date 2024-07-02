@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.connector;
 
 import com.google.common.collect.Lists;
@@ -103,10 +102,13 @@ public class RemoteFileOperations {
         List<Future<Map<RemotePathKey, List<RemoteFileDesc>>>> futures = Lists.newArrayList();
         List<Map<RemotePathKey, List<RemoteFileDesc>>> result = Lists.newArrayList();
 
+        RemotePathKey.HudiContext hudiContext = new RemotePathKey.HudiContext();
+
         Tracers.count(Tracers.Module.EXTERNAL, HMS_PARTITIONS_REMOTE_FILES, cacheMissSize);
         try (Timer ignored = Tracers.watchScope(Tracers.Module.EXTERNAL, HMS_PARTITIONS_REMOTE_FILES)) {
             for (Partition partition : partitions) {
                 RemotePathKey pathKey = RemotePathKey.of(partition.getFullPath(), isRecursive, hudiTableLocation);
+                pathKey.setHudiContext(hudiContext);
                 Future<Map<RemotePathKey, List<RemoteFileDesc>>> future = pullRemoteFileExecutor.submit(() ->
                         remoteFileIO.getRemoteFiles(pathKey, useCache));
                 futures.add(future);
@@ -286,6 +288,15 @@ public class RemoteFileOperations {
         } catch (Exception e) {
             LOG.error("Failed to list path {}", path, e);
             throw new StarRocksConnectorException("Failed to list path %s. msg: %s", path.toString(), e.getMessage());
+        }
+    }
+
+    public FileStatus[] getFileStatus(Path... paths) {
+        try {
+            return remoteFileIO.getFileStatus(paths);
+        } catch (Exception e) {
+            LOG.error("Failed to get file status for paths: {}", paths, e);
+            throw new StarRocksConnectorException("Failed to get file status for paths: %s. msg: %s", paths, e.getMessage());
         }
     }
 }

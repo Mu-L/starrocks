@@ -18,6 +18,7 @@
 
 #include "fs/fs_util.h"
 #include "storage/del_vector.h"
+#include "storage/lake/lake_persistent_index.h"
 #include "storage/lake/location_provider.h"
 #include "storage/lake/metacache.h"
 #include "storage/lake/update_manager.h"
@@ -36,7 +37,7 @@ static std::string delvec_cache_key(int64_t tablet_id, const DelvecPagePB& page)
     return cache_key_pb.SerializeAsString();
 }
 
-MetaFileBuilder::MetaFileBuilder(Tablet tablet, std::shared_ptr<TabletMetadata> metadata)
+MetaFileBuilder::MetaFileBuilder(const Tablet& tablet, std::shared_ptr<TabletMetadata> metadata)
         : _tablet(tablet), _tablet_meta(std::move(metadata)), _update_mgr(_tablet.update_mgr()) {}
 
 void MetaFileBuilder::append_delvec(const DelVectorPtr& delvec, uint32_t segment_id) {
@@ -50,6 +51,48 @@ void MetaFileBuilder::append_delvec(const DelVectorPtr& delvec, uint32_t segment
         _delvecs[segment_id].set_size(size);
         _segmentid_to_delvec[segment_id] = delvec;
     }
+}
+
+void MetaFileBuilder::append_dcg(uint32_t rssid, const std::vector<std::string>& filenames,
+                                 const std::vector<std::vector<ColumnUID>>& unique_column_id_list) {
+    DeltaColumnGroupVerPB& dcg_ver = (*_tablet_meta->mutable_dcg_meta()->mutable_dcgs())[rssid];
+    DeltaColumnGroupVerPB new_dcg_ver;
+    std::unordered_set<ColumnUID> need_to_remove_cuids_filter;
+
+    // 1. append new dcgs
+    DCHECK(filenames.size() == unique_column_id_list.size());
+    for (int i = 0; i < filenames.size(); i++) {
+        new_dcg_ver.add_column_files(filenames[i]);
+        DeltaColumnGroupColumnIdsPB unique_cids;
+        for (const ColumnUID uid : unique_column_id_list[i]) {
+            unique_cids.add_column_ids(uid);
+            // Build filter so we can remove old columns at second step.
+            need_to_remove_cuids_filter.insert(uid);
+        }
+        new_dcg_ver.add_unique_column_ids()->CopyFrom(unique_cids);
+        new_dcg_ver.add_versions(_tablet_meta->version());
+    }
+    // 2. remove old dcgs
+    DCHECK(dcg_ver.unique_column_ids_size() == dcg_ver.column_files_size());
+    DCHECK(dcg_ver.unique_column_ids_size() == dcg_ver.versions_size());
+    for (int i = 0; i < dcg_ver.unique_column_ids_size(); i++) {
+        auto* mcids = dcg_ver.mutable_unique_column_ids(i)->mutable_column_ids();
+        mcids->erase(std::remove_if(mcids->begin(), mcids->end(),
+                                    [&](uint32 cuid) { return need_to_remove_cuids_filter.count(cuid) > 0; }),
+                     mcids->end());
+        if (!mcids->empty()) {
+            new_dcg_ver.add_unique_column_ids()->CopyFrom(dcg_ver.unique_column_ids(i));
+            new_dcg_ver.add_column_files(dcg_ver.column_files(i));
+            new_dcg_ver.add_versions(dcg_ver.versions(i));
+        } else {
+            // Put this `.cols` files into orphan files
+            FileMetaPB file_meta;
+            file_meta.set_name(dcg_ver.column_files(i));
+            _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));
+        }
+    }
+
+    (*_tablet_meta->mutable_dcg_meta()->mutable_dcgs())[rssid] = new_dcg_ver;
 }
 
 void MetaFileBuilder::apply_opwrite(const TxnLogPB_OpWrite& op_write, const std::map<int, FileInfo>& replace_segments,
@@ -73,6 +116,14 @@ void MetaFileBuilder::apply_opwrite(const TxnLogPB_OpWrite& op_write, const std:
     }
 
     rowset->set_id(_tablet_meta->next_rowset_id());
+    rowset->set_version(_tablet_meta->version());
+    // collect del files
+    for (int i = 0; i < op_write.dels_size(); i++) {
+        DelfileWithRowsetId del_file_with_rid;
+        del_file_with_rid.set_name(op_write.dels(i));
+        del_file_with_rid.set_origin_rowset_id(rowset->id());
+        rowset->add_del_files()->CopyFrom(del_file_with_rid);
+    }
     // if rowset don't contain segment files, still inc next_rowset_id
     _tablet_meta->set_next_rowset_id(_tablet_meta->next_rowset_id() + std::max(1, rowset->segments_size()));
     // collect trash files
@@ -82,10 +133,69 @@ void MetaFileBuilder::apply_opwrite(const TxnLogPB_OpWrite& op_write, const std:
         file_meta.set_name(orphan_file);
         _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));
     }
-    for (const auto& del_file : op_write.dels()) {
+}
+
+void MetaFileBuilder::apply_column_mode_partial_update(const TxnLogPB_OpWrite& op_write) {
+    // remove all segments that only contains partial columns.
+    for (const auto& segment : op_write.rowset().segments()) {
         FileMetaPB file_meta;
-        file_meta.set_name(del_file);
+        file_meta.set_name(segment);
         _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));
+    }
+}
+
+// delete from protobuf Map and return deleted count
+template <typename T>
+static int delete_from_protobuf_map(T* protobuf_map, const std::vector<std::pair<uint32_t, uint32_t>>& delete_sid_range,
+                                    const std::function<void(const T&)>& gc_func) {
+    // collect item that had been deleted.
+    T gc_map;
+    int erase_cnt = 0;
+    auto it = protobuf_map->begin();
+    while (it != protobuf_map->end()) {
+        bool need_del = false;
+        for (const auto& range : delete_sid_range) {
+            if (it->first >= range.first && it->first <= range.second) {
+                need_del = true;
+                break;
+            }
+        }
+        if (need_del) {
+            gc_map[it->first] = it->second;
+            it = protobuf_map->erase(it);
+            erase_cnt++;
+        } else {
+            it++;
+        }
+    }
+    gc_func(gc_map);
+    return erase_cnt;
+}
+
+// When using cloud native persistent index, the del files which are above rebuild point,
+// need to be transfer to compaction's output rowset.
+// Use this function to collect all del files that need to be transfer.
+void MetaFileBuilder::_collect_del_files_above_rebuild_point(RowsetMetadataPB* rowset,
+                                                             std::vector<DelfileWithRowsetId>* collect_del_files) {
+    if (!_tablet_meta->enable_persistent_index() ||
+        _tablet_meta->persistent_index_type() != PersistentIndexTypePB::CLOUD_NATIVE) {
+        // do nothing, unpersisted del files is collect only for cloud native persistent index.
+        return;
+    }
+    if (rowset->del_files_size() == 0) {
+        return;
+    }
+    const auto& sstables = _tablet_meta->sstable_meta().sstables();
+    // Rebuild persistent index from `rebuild_rss_rowid_point`
+    const uint64_t rebuild_rss_rowid_point = sstables.empty() ? 0 : sstables.rbegin()->max_rss_rowid();
+    const uint32_t rebuild_rss_id = rebuild_rss_rowid_point >> 32;
+    if (LakePersistentIndex::needs_rowset_rebuild(*rowset, rebuild_rss_id)) {
+        // Above rebuild point
+        for (const auto& each : rowset->del_files()) {
+            collect_del_files->push_back(each);
+        }
+        // These del files will be collect and transfer to compaction's output rowset.
+        rowset->clear_del_files();
     }
 }
 
@@ -98,6 +208,8 @@ void MetaFileBuilder::apply_opcompaction(const TxnLogPB_OpCompaction& op_compact
         uint32_t id;
         bool operator()(const uint32_t rowid) const { return rowid == id; }
     };
+    // Only used for cloud native persistent index.
+    std::vector<DelfileWithRowsetId> collect_del_files;
     auto it = _tablet_meta->mutable_rowsets()->begin();
     while (it != _tablet_meta->mutable_rowsets()->end()) {
         auto search_it = std::find_if(op_compaction.input_rowsets().begin(), op_compaction.input_rowsets().end(),
@@ -105,6 +217,8 @@ void MetaFileBuilder::apply_opcompaction(const TxnLogPB_OpCompaction& op_compact
         if (search_it != op_compaction.input_rowsets().end()) {
             // find it
             delete_delvec_sid_range.emplace_back(it->id(), it->id() + it->segments_size() - 1);
+            // Collect del files.
+            _collect_del_files_above_rebuild_point(&(*it), &collect_del_files);
             _tablet_meta->mutable_compaction_inputs()->Add(std::move(*it));
             it = _tablet_meta->mutable_rowsets()->erase(it);
             del_range_ss << "[" << delete_delvec_sid_range.back().first << "," << delete_delvec_sid_range.back().second
@@ -114,22 +228,30 @@ void MetaFileBuilder::apply_opcompaction(const TxnLogPB_OpCompaction& op_compact
         }
     }
     // delete delvec by input rowsets
-    int delvec_erase_cnt = 0;
-    auto delvec_it = _tablet_meta->mutable_delvec_meta()->mutable_delvecs()->begin();
-    while (delvec_it != _tablet_meta->mutable_delvec_meta()->mutable_delvecs()->end()) {
-        bool need_del = false;
-        for (const auto& range : delete_delvec_sid_range) {
-            if (delvec_it->first >= range.first && delvec_it->first <= range.second) {
-                need_del = true;
-                break;
+    auto delvecs = _tablet_meta->mutable_delvec_meta()->mutable_delvecs();
+    using T_DELVEC = std::decay_t<decltype(*delvecs)>;
+    int delvec_erase_cnt =
+            delete_from_protobuf_map<T_DELVEC>(delvecs, delete_delvec_sid_range, [](const T_DELVEC& gc_map) {});
+    // delete dcg by input rowsets
+    auto dcgs = _tablet_meta->mutable_dcg_meta()->mutable_dcgs();
+    using T_DCG = std::decay_t<decltype(*dcgs)>;
+    int dcg_erase_cnt = delete_from_protobuf_map<T_DCG>(dcgs, delete_delvec_sid_range, [&](const T_DCG& gc_map) {
+        for (const auto& each : gc_map) {
+            for (const auto& each_file : each.second.column_files()) {
+                FileMetaPB file_meta;
+                file_meta.set_name(each_file);
+                // Put useless `.cols` files into orphan files
+                _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));
             }
         }
-        if (need_del) {
-            delvec_it = _tablet_meta->mutable_delvec_meta()->mutable_delvecs()->erase(delvec_it);
-            delvec_erase_cnt++;
-        } else {
-            delvec_it++;
-        }
+    });
+
+    // remove compacted sst
+    for (auto& input_sstable : op_compaction.input_sstables()) {
+        FileMetaPB file_meta;
+        file_meta.set_name(input_sstable.filename());
+        file_meta.set_size(input_sstable.filesize());
+        _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));
     }
 
     // add output rowset
@@ -138,12 +260,26 @@ void MetaFileBuilder::apply_opcompaction(const TxnLogPB_OpCompaction& op_compact
         rowset->CopyFrom(op_compaction.output_rowset());
         rowset->set_id(_tablet_meta->next_rowset_id());
         rowset->set_max_compact_input_rowset_id(max_compact_input_rowset_id);
+        rowset->set_version(_tablet_meta->version());
+        for (const auto& each : collect_del_files) {
+            rowset->add_del_files()->CopyFrom(each);
+        }
         _tablet_meta->set_next_rowset_id(_tablet_meta->next_rowset_id() + rowset->segments_size());
     }
 
-    VLOG(2) << fmt::format("MetaFileBuilder apply_opcompaction, id:{} input range:{} delvec del cnt:{} output:{}",
-                           _tablet_meta->id(), del_range_ss.str(), delvec_erase_cnt,
-                           op_compaction.output_rowset().ShortDebugString());
+    VLOG(2) << fmt::format(
+            "MetaFileBuilder apply_opcompaction, id:{} input range:{} delvec del cnt:{} dcg del cnt:{} output:{}",
+            _tablet_meta->id(), del_range_ss.str(), delvec_erase_cnt, dcg_erase_cnt,
+            op_compaction.output_rowset().ShortDebugString());
+}
+
+void MetaFileBuilder::apply_opcompaction_with_conflict(const TxnLogPB_OpCompaction& op_compaction) {
+    // add output segments to orphan files
+    for (int i = 0; i < op_compaction.output_rowset().segments_size(); i++) {
+        FileMetaPB file_meta;
+        file_meta.set_name(op_compaction.output_rowset().segments(i));
+        _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));
+    }
 }
 
 Status MetaFileBuilder::update_num_del_stat(const std::map<uint32_t, size_t>& segment_id_to_add_dels) {
@@ -272,7 +408,12 @@ void MetaFileBuilder::_fill_delvec_cache() {
     }
 }
 
-Status get_del_vec(TabletManager* tablet_mgr, const TabletMetadata& metadata, uint32_t segment_id, DelVector* delvec) {
+void MetaFileBuilder::finalize_sstable_meta(const PersistentIndexSstableMetaPB& sstable_meta) {
+    _tablet_meta->mutable_sstable_meta()->CopyFrom(sstable_meta);
+}
+
+Status get_del_vec(TabletManager* tablet_mgr, const TabletMetadata& metadata, uint32_t segment_id, bool fill_cache,
+                   DelVector* delvec) {
     // find delvec by segment id
     auto iter = metadata.delvec_meta().delvecs().find(segment_id);
     if (iter != metadata.delvec_meta().delvecs().end()) {
@@ -295,16 +436,18 @@ Status get_del_vec(TabletManager* tablet_mgr, const TabletMetadata& metadata, ui
             return Status::InternalError("Can't find delvec file name");
         }
         const auto& delvec_name = iter2->second.name();
-        RandomAccessFileOptions opts{.skip_fill_local_cache = true};
+        RandomAccessFileOptions opts{.skip_fill_local_cache = !fill_cache};
         ASSIGN_OR_RETURN(auto rf,
                          fs::new_random_access_file(opts, tablet_mgr->delvec_location(metadata.id(), delvec_name)));
         RETURN_IF_ERROR(rf->read_at_fully(iter->second.offset(), buf.data(), iter->second.size()));
         // parse delvec
         RETURN_IF_ERROR(delvec->load(iter->second.version(), buf.data(), iter->second.size()));
         // put in cache
-        auto delvec_cache_ptr = std::make_shared<DelVector>();
-        delvec_cache_ptr->copy_from(*delvec);
-        tablet_mgr->metacache()->cache_delvec(cache_key, delvec_cache_ptr);
+        if (fill_cache) {
+            auto delvec_cache_ptr = std::make_shared<DelVector>();
+            delvec_cache_ptr->copy_from(*delvec);
+            tablet_mgr->metacache()->cache_delvec(cache_key, delvec_cache_ptr);
+        }
         TRACE("end load delvec");
         return Status::OK();
     }
@@ -319,30 +462,6 @@ bool is_primary_key(TabletMetadata* metadata) {
 
 bool is_primary_key(const TabletMetadata& metadata) {
     return metadata.schema().keys_type() == KeysType::PRIMARY_KEYS;
-}
-
-void rowset_rssid_to_path(const TabletMetadata& metadata, const TxnLogPB_OpWrite* op_write,
-                          std::unordered_map<uint32_t, FileInfo>& rssid_to_file_info) {
-    auto get_file_info_from_rowset = [&](const RowsetMetadataPB& meta, const uint32_t rowset_id) -> void {
-        bool has_segment_size = (meta.segments_size() == meta.segment_size_size());
-        for (int i = 0; i < meta.segments_size(); i++) {
-            FileInfo segment_info{.path = meta.segments(i)};
-            if (LIKELY(has_segment_size)) {
-                segment_info.size = meta.segment_size(i);
-            }
-            rssid_to_file_info[rowset_id + i] = segment_info;
-        }
-    };
-
-    for (auto& rs : metadata.rowsets()) {
-        get_file_info_from_rowset(rs, rs.id());
-    }
-    if (op_write != nullptr) {
-        const uint32_t rowset_id = metadata.next_rowset_id();
-        for (int i = 0; i < op_write->rowset().segments_size(); i++) {
-            get_file_info_from_rowset(op_write->rowset(), rowset_id);
-        }
-    }
 }
 
 } // namespace starrocks::lake

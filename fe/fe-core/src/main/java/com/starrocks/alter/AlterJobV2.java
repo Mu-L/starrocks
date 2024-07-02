@@ -51,13 +51,13 @@ import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.privilege.PrivilegeBuiltinConstants;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.ast.UserIdentity;
 import io.opentelemetry.api.trace.Span;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.List;
 import java.util.Optional;
@@ -110,6 +110,8 @@ public abstract class AlterJobV2 implements Writable {
     protected long finishedTimeMs = -1;
     @SerializedName(value = "timeoutMs")
     protected long timeoutMs = -1;
+    @SerializedName(value = "warehouseId")
+    protected long warehouseId = WarehouseManager.DEFAULT_WAREHOUSE_ID;
 
     protected Span span;
 
@@ -161,6 +163,10 @@ public abstract class AlterJobV2 implements Writable {
         return tableName;
     }
 
+    public long getTimeoutMs() {
+        return timeoutMs;
+    }
+
     public boolean isTimeout() {
         return System.currentTimeMillis() - createTimeMs > timeoutMs;
     }
@@ -179,6 +185,10 @@ public abstract class AlterJobV2 implements Writable {
 
     public void setFinishedTimeMs(long finishedTimeMs) {
         this.finishedTimeMs = finishedTimeMs;
+    }
+
+    public void setWarehouseId(long warehouseId) {
+        this.warehouseId = warehouseId;
     }
 
     public void createConnectContextIfNeeded() {
@@ -239,7 +249,7 @@ public abstract class AlterJobV2 implements Writable {
         }
     }
 
-    public final boolean cancel(String errMsg) {
+    public boolean cancel(String errMsg) {
         synchronized (this) {
             return cancelImpl(errMsg);
         }
@@ -261,8 +271,10 @@ public abstract class AlterJobV2 implements Writable {
                 throw new AlterCancelException("Table " + tableId + " does not exist");
             }
 
-            unHealthyTabletId = tbl.checkAndGetUnhealthyTablet(GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo(),
-                    GlobalStateMgr.getCurrentState().getTabletScheduler());
+            if (tbl.isOlapTable()) {
+                unHealthyTabletId = tbl.checkAndGetUnhealthyTablet(GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo(),
+                        GlobalStateMgr.getCurrentState().getTabletScheduler());
+            }
         } finally {
             locker.unLockDatabase(db, LockType.READ);
         }
@@ -302,38 +314,6 @@ public abstract class AlterJobV2 implements Writable {
     public static AlterJobV2 read(DataInput in) throws IOException {
         String json = Text.readString(in);
         return GsonUtils.GSON.fromJson(json, AlterJobV2.class);
-    }
-
-    @Override
-    public void write(DataOutput out) throws IOException {
-        Text.writeString(out, type.name());
-        Text.writeString(out, jobState.name());
-
-        out.writeLong(jobId);
-        out.writeLong(dbId);
-        out.writeLong(tableId);
-        Text.writeString(out, tableName);
-
-        Text.writeString(out, errMsg);
-        out.writeLong(createTimeMs);
-        out.writeLong(finishedTimeMs);
-        out.writeLong(timeoutMs);
-    }
-
-    public void readFields(DataInput in) throws IOException {
-        // read common members as write in AlterJobV2.write().
-        // except 'type' member, which is read in AlterJobV2.read()
-        jobState = JobState.valueOf(Text.readString(in));
-
-        jobId = in.readLong();
-        dbId = in.readLong();
-        tableId = in.readLong();
-        tableName = Text.readString(in);
-
-        errMsg = Text.readString(in);
-        createTimeMs = in.readLong();
-        finishedTimeMs = in.readLong();
-        timeoutMs = in.readLong();
     }
 
     public abstract Optional<Long> getTransactionId();

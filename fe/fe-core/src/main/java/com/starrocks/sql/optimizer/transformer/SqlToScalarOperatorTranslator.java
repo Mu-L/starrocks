@@ -37,6 +37,7 @@ import com.starrocks.analysis.InformationFunction;
 import com.starrocks.analysis.IsNullPredicate;
 import com.starrocks.analysis.LikePredicate;
 import com.starrocks.analysis.LiteralExpr;
+import com.starrocks.analysis.MatchExpr;
 import com.starrocks.analysis.MultiInPredicate;
 import com.starrocks.analysis.NullLiteral;
 import com.starrocks.analysis.Parameter;
@@ -94,6 +95,7 @@ import com.starrocks.sql.optimizer.operator.scalar.IsNullPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.LambdaFunctionOperator;
 import com.starrocks.sql.optimizer.operator.scalar.LikePredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.MapOperator;
+import com.starrocks.sql.optimizer.operator.scalar.MatchExprOperator;
 import com.starrocks.sql.optimizer.operator.scalar.MultiInPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.operator.scalar.SubfieldOperator;
@@ -652,6 +654,17 @@ public final class SqlToScalarOperatorTranslator {
         }
 
         @Override
+        public ScalarOperator visitMatchExpr(MatchExpr node, Context context)
+                throws SemanticException {
+            ScalarOperator[] children = node.getChildren()
+                    .stream()
+                    .map(child -> visit(child, context.clone(node)))
+                    .toArray(ScalarOperator[]::new);
+
+            return new MatchExprOperator(children); 
+        }
+
+        @Override
         public ScalarOperator visitLiteral(LiteralExpr node, Context context) {
             if (node instanceof NullLiteral) {
                 return ConstantOperator.createNull(node.getType());
@@ -667,6 +680,12 @@ public final class SqlToScalarOperatorTranslator {
                     .map(child -> visit(child, context.clone(node)))
                     .collect(Collectors.toList());
 
+            // for nonDeterministicFunctions, we need add an argument as its unique id to distinguish
+            // the reusing behavior in common exprs
+            if (FunctionSet.nonDeterministicFunctions.contains(node.getFnName().getFunction())) {
+                arguments.add(ConstantOperator.createInt(columnRefFactory.getNextUniqueId()));
+            }
+
             CallOperator callOperator = new CallOperator(
                     node.getFnName().getFunction(),
                     node.getType(),
@@ -674,9 +693,6 @@ public final class SqlToScalarOperatorTranslator {
                     node.getFn(),
                     node.getParams().isDistinct());
             callOperator.setHints(node.getHints());
-            if (FunctionSet.nonDeterministicFunctions.contains(node.getFnName().getFunction())) {
-                callOperator.setId(columnRefFactory.getNextUniqueId());
-            }
             return callOperator;
         }
 

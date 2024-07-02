@@ -54,9 +54,8 @@
 
 namespace starrocks::lake {
 
-Status ReplicationTxnManager::remote_snapshot(const TRemoteSnapshotRequest& request, std::string* src_snapshot_path,
-                                              bool* incremental_snapshot) {
-    if (StorageEngine::instance()->bg_worker_stopped()) {
+Status ReplicationTxnManager::remote_snapshot(const TRemoteSnapshotRequest& request, TSnapshotInfo* src_snapshot_info) {
+    if (UNLIKELY(StorageEngine::instance()->bg_worker_stopped())) {
         return Status::InternalError("Process is going to quit. The remote snapshot will stop");
     }
 
@@ -80,7 +79,7 @@ Status ReplicationTxnManager::remote_snapshot(const TRemoteSnapshotRequest& requ
     for (auto v = request.visible_version + 1; v <= request.src_visible_version; ++v) {
         missed_versions.emplace_back(Version(v, v));
     }
-    if (missed_versions.empty()) {
+    if (UNLIKELY(missed_versions.empty())) {
         LOG(WARNING) << "Remote snapshot tablet skipped, no missing version"
                      << ", txn_id: " << request.transaction_id << ", tablet_id: " << request.tablet_id
                      << ", src_tablet_id: " << request.src_tablet_id << ", visible_version: " << request.visible_version
@@ -88,28 +87,30 @@ Status ReplicationTxnManager::remote_snapshot(const TRemoteSnapshotRequest& requ
         return Status::Corruption("No missing version");
     }
 
-    LOG(INFO) << "Start make remote snapshot tablet"
-              << ", txn_id: " << request.transaction_id << ", tablet_id: " << request.tablet_id
-              << ", src_tablet_id: " << request.src_tablet_id << ", visible_version: " << request.visible_version
+    LOG(INFO) << "Start make remote snapshot, txn_id: " << request.transaction_id
+              << ", tablet_id: " << request.tablet_id << ", src_tablet_id: " << request.src_tablet_id
+              << ", visible_version: " << request.visible_version
               << ", snapshot_version: " << request.src_visible_version << ", missed_versions: ["
               << (request.visible_version + 1) << " ... " << request.src_visible_version << "]";
 
     Status status;
-    TBackend src_backend;
     if (request.visible_version <= 1) { // Make full snapshot
-        *incremental_snapshot = false;
-        status = make_remote_snapshot(request, nullptr, nullptr, &src_backend, src_snapshot_path);
+        src_snapshot_info->incremental_snapshot = false;
+        status = make_remote_snapshot(request, nullptr, nullptr, &src_snapshot_info->backend,
+                                      &src_snapshot_info->snapshot_path);
     } else { // Try to make incremental snapshot first, if failed, make full snapshot
-        *incremental_snapshot = true;
-        status = make_remote_snapshot(request, &missed_versions, nullptr, &src_backend, src_snapshot_path);
+        src_snapshot_info->incremental_snapshot = true;
+        status = make_remote_snapshot(request, &missed_versions, nullptr, &src_snapshot_info->backend,
+                                      &src_snapshot_info->snapshot_path);
         if (!status.ok()) {
             LOG(INFO) << "Failed to make incremental snapshot: " << status << ". switch to fully snapshot"
                       << ", txn_id: " << request.transaction_id << ", tablet_id: " << request.tablet_id
                       << ", src_tablet_id: " << request.src_tablet_id
                       << ", visible_version: " << request.visible_version
                       << ", snapshot_version: " << request.src_visible_version;
-            *incremental_snapshot = false;
-            status = make_remote_snapshot(request, nullptr, nullptr, &src_backend, src_snapshot_path);
+            src_snapshot_info->incremental_snapshot = false;
+            status = make_remote_snapshot(request, nullptr, nullptr, &src_snapshot_info->backend,
+                                          &src_snapshot_info->snapshot_path);
         }
     }
 
@@ -121,10 +122,16 @@ Status ReplicationTxnManager::remote_snapshot(const TRemoteSnapshotRequest& requ
         return status;
     }
 
-    LOG(INFO) << "Made snapshot from " << src_backend.host << ":" << src_backend.be_port << ":" << *src_snapshot_path
+    src_snapshot_info->__isset.backend = true;
+    src_snapshot_info->__isset.snapshot_path = true;
+    src_snapshot_info->__isset.incremental_snapshot = true;
+
+    LOG(INFO) << "Made remote snapshot from " << src_snapshot_info->backend.host << ":"
+              << src_snapshot_info->backend.be_port << ":" << src_snapshot_info->snapshot_path
               << ", txn_id: " << request.transaction_id << ", tablet_id: " << request.tablet_id
               << ", src_tablet_id: " << request.src_tablet_id << ", visible_version: " << request.visible_version
-              << ", snapshot_version: " << request.src_visible_version << ", is_incremental: " << *incremental_snapshot;
+              << ", snapshot_version: " << request.src_visible_version
+              << ", incremental_snapshot: " << src_snapshot_info->incremental_snapshot;
 
     auto txn_log = std::make_shared<TxnLog>();
     txn_log->set_tablet_id(request.tablet_id);
@@ -135,17 +142,17 @@ Status ReplicationTxnManager::remote_snapshot(const TRemoteSnapshotRequest& requ
     txn_meta->set_txn_state(ReplicationTxnStatePB::TXN_SNAPSHOTED);
     txn_meta->set_tablet_id(request.tablet_id);
     txn_meta->set_visible_version(request.visible_version);
-    txn_meta->set_src_backend_host(src_backend.host);
-    txn_meta->set_src_backend_port(src_backend.be_port);
-    txn_meta->set_src_snapshot_path(*src_snapshot_path);
+    txn_meta->set_src_backend_host(src_snapshot_info->backend.host);
+    txn_meta->set_src_backend_port(src_snapshot_info->backend.be_port);
+    txn_meta->set_src_snapshot_path(src_snapshot_info->snapshot_path);
     txn_meta->set_snapshot_version(request.src_visible_version);
-    txn_meta->set_incremental_snapshot(*incremental_snapshot);
+    txn_meta->set_incremental_snapshot(src_snapshot_info->incremental_snapshot);
 
     return tablet.put_txn_slog(txn_log);
 }
 
 Status ReplicationTxnManager::replicate_snapshot(const TReplicateSnapshotRequest& request) {
-    if (StorageEngine::instance()->bg_worker_stopped()) {
+    if (UNLIKELY(StorageEngine::instance()->bg_worker_stopped())) {
         return Status::InternalError("Process is going to quit. The replicate snapshot will stop");
     }
 
@@ -180,7 +187,7 @@ Status ReplicationTxnManager::replicate_snapshot(const TReplicateSnapshotRequest
             continue;
         }
 
-        LOG(INFO) << "Replicated snapshot from " << src_snapshot_info.backend.host << ":"
+        LOG(INFO) << "Replicated remote snapshot from " << src_snapshot_info.backend.host << ":"
                   << src_snapshot_info.backend.http_port << ":" << src_snapshot_info.snapshot_path << " to "
                   << _tablet_manager->location_provider()->segment_root_location(request.tablet_id)
                   << ", keys_type: " << KeysType_Name(tablet_metadata->schema().keys_type())
@@ -227,7 +234,7 @@ Status ReplicationTxnManager::make_remote_snapshot(const TRemoteSnapshotRequest&
 }
 
 Status ReplicationTxnManager::replicate_remote_snapshot(const TReplicateSnapshotRequest& request,
-                                                        const TRemoteSnapshotInfo& src_snapshot_info,
+                                                        const TSnapshotInfo& src_snapshot_info,
                                                         const TabletMetadataPtr& tablet_metadata) {
     auto txn_log = std::make_shared<TxnLog>();
     std::unordered_map<std::string, std::string> filename_map;
@@ -307,6 +314,13 @@ Status ReplicationTxnManager::replicate_remote_snapshot(const TReplicateSnapshot
         } else {
             // Get source schema from previous saved in tablet meta
             source_schema_pb = &tablet_metadata->source_schema();
+        }
+
+        if (source_schema_pb == nullptr) {
+            LOG(WARNING) << "Failed to get source schema, tablet meta has schema: "
+                         << snapshot_meta.tablet_meta().has_schema() << ", rowset meta has schema: "
+                         << (!rowset_metas.empty() && rowset_metas.front().has_tablet_schema());
+            return Status::Corruption("Failed to get source schema");
         }
     }
 

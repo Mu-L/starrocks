@@ -648,7 +648,6 @@ public class MvRewriteTest extends MvRewriteTestBase {
                 "  |  group by: 23: add, 17: v1");
         PlanTestBase.assertContains(plan5, "  1:Project\n" +
                 "  |  <slot 17> : 17: v1\n" +
-                "  |  <slot 18> : 18: t1d\n" +
                 "  |  <slot 19> : 19: total_sum\n" +
                 "  |  <slot 20> : 20: total_num\n" +
                 "  |  <slot 23> : 17: v1 + 1");
@@ -892,7 +891,7 @@ public class MvRewriteTest extends MvRewriteTestBase {
     @Test
     public void testAggExprRewrite() throws Exception {
         // Group by Cast Expr
-        starRocksAssert.withTable("json_tbl",
+        starRocksAssert.withMTable("json_tbl",
                 () -> {
                     {
                         String mvName = "mv_q15";
@@ -955,7 +954,7 @@ public class MvRewriteTest extends MvRewriteTestBase {
 
     @Test
     public void testPkFk() throws SQLException {
-        starRocksAssert.withTables(List.of(
+        starRocksAssert.withMTables(List.of(
                         new MTable("parent_table1", "k1",
                                 List.of(
                                         "k1 INT",

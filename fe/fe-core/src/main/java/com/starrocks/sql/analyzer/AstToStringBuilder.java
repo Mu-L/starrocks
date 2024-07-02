@@ -40,9 +40,11 @@ import com.starrocks.analysis.HintNode;
 import com.starrocks.analysis.InPredicate;
 import com.starrocks.analysis.InformationFunction;
 import com.starrocks.analysis.IsNullPredicate;
+import com.starrocks.analysis.LargeStringLiteral;
 import com.starrocks.analysis.LikePredicate;
 import com.starrocks.analysis.LimitElement;
 import com.starrocks.analysis.LiteralExpr;
+import com.starrocks.analysis.MatchExpr;
 import com.starrocks.analysis.OrderByElement;
 import com.starrocks.analysis.ParseNode;
 import com.starrocks.analysis.SlotRef;
@@ -89,6 +91,7 @@ import com.starrocks.sql.ast.BaseCreateAlterUserStmt;
 import com.starrocks.sql.ast.BaseGrantRevokePrivilegeStmt;
 import com.starrocks.sql.ast.BaseGrantRevokeRoleStmt;
 import com.starrocks.sql.ast.CTERelation;
+import com.starrocks.sql.ast.CleanTemporaryTableStmt;
 import com.starrocks.sql.ast.CreateCatalogStmt;
 import com.starrocks.sql.ast.CreateResourceStmt;
 import com.starrocks.sql.ast.CreateRoutineLoadStmt;
@@ -311,7 +314,9 @@ public class AstToStringBuilder {
                 if (setVar instanceof SystemVariable) {
                     SystemVariable systemVariable = (SystemVariable) setVar;
                     String setVarSql = "";
-                    setVarSql += systemVariable.getType().toString() + " ";
+                    if (systemVariable.getType() != null) {
+                        setVarSql += systemVariable.getType().toString() + " ";
+                    }
                     setVarSql += "`" + systemVariable.getVariable() + "`";
                     setVarSql += " = ";
                     setVarSql += visit(systemVariable.getResolvedExpression());
@@ -382,6 +387,13 @@ public class AstToStringBuilder {
             }
 
             sb.append(stmt.getMvName());
+            return sb.toString();
+        }
+
+        @Override
+        public String visitCleanTemporaryTableStatement(CleanTemporaryTableStmt stmt, Void context) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("clean temporary table on session '").append(stmt.getSessionId()).append("'");
             return sb.toString();
         }
 
@@ -629,7 +641,14 @@ public class AstToStringBuilder {
                 sqlBuilder.append(relation.getJoinOp());
             }
             if (relation.getJoinHint() != null && !relation.getJoinHint().isEmpty()) {
-                sqlBuilder.append(" [").append(relation.getJoinHint()).append("]");
+                StringBuilder sb = new StringBuilder();
+                sb.append(relation.getJoinHint());
+                if (relation.getSkewColumn() != null) {
+                    sb.append("|").append(visit(relation.getSkewColumn())).append("(").append(
+                            relation.getSkewValues().stream().map(this::visit).
+                                    collect(Collectors.joining(","))).append(")");
+                }
+                sqlBuilder.append(" [").append(sb).append("]");
             }
             sqlBuilder.append(" ");
             if (relation.isLateral()) {
@@ -784,16 +803,7 @@ public class AstToStringBuilder {
             StringBuilder sb = new StringBuilder();
             sb.append(FileTableFunctionRelation.IDENTIFIER);
             sb.append("(");
-            boolean first = true;
-            for (Map.Entry<String, String> entry : node.getProperties().entrySet()) {
-                if (!first) {
-                    sb.append(",");
-                }
-                first = false;
-                sb.append("'").append(entry.getKey()).append("'");
-                sb.append("=");
-                sb.append("'").append((entry.getValue())).append("'");
-            }
+            sb.append(new PrintableMap<String, String>(node.getProperties(), "=", true, false, true));
             sb.append(")");
             return sb.toString();
         }
@@ -1131,6 +1141,11 @@ public class AstToStringBuilder {
                     + " " + node.getOp() + " " + printWithParentheses(node.getChild(1));
         }
 
+        public String visitMatchExpr(MatchExpr node, Void context) {
+            return printWithParentheses(node.getChild(0))
+                    + " MATCH " + printWithParentheses(node.getChild(1));
+        }
+
         @Override
         public String visitLiteral(LiteralExpr node, Void context) {
             if (node instanceof DecimalLiteral) {
@@ -1139,6 +1154,8 @@ public class AstToStringBuilder {
                 } else {
                     return visitExpression(node, context);
                 }
+            } else if (node instanceof LargeStringLiteral) {
+                return ((LargeStringLiteral) node).toFullSqlImpl();
             } else {
                 return visitExpression(node, context);
             }
@@ -1418,12 +1435,14 @@ public class AstToStringBuilder {
     public static void getDdlStmt(Table table, List<String> createTableStmt, List<String> addPartitionStmt,
                                   List<String> createRollupStmt, boolean separatePartition,
                                   boolean hidePassword) {
-        getDdlStmt(null, table, createTableStmt, addPartitionStmt, createRollupStmt, separatePartition, hidePassword);
+        getDdlStmt(null, table, createTableStmt, addPartitionStmt, createRollupStmt, separatePartition,
+                hidePassword, table.isTemporaryTable());
     }
 
     public static void getDdlStmt(String dbName, Table table, List<String> createTableStmt,
                                   List<String> addPartitionStmt,
-                                  List<String> createRollupStmt, boolean separatePartition, boolean hidePassword) {
+                                  List<String> createRollupStmt, boolean separatePartition, boolean hidePassword,
+                                  boolean isTemporary) {
         // 1. create table
         // 1.1 materialized view
         if (table.isMaterializedView()) {
@@ -1464,6 +1483,9 @@ public class AstToStringBuilder {
                 || table.getType() == Table.TableType.FILE) {
             sb.append("EXTERNAL ");
         }
+        if (isTemporary) {
+            sb.append("TEMPORARY ");
+        }
         sb.append("TABLE ");
         if (!Strings.isNullOrEmpty(dbName)) {
             sb.append("`").append(dbName).append("`.");
@@ -1479,12 +1501,12 @@ public class AstToStringBuilder {
             if (table.isOlapOrCloudNativeTable() || table.getType() == Table.TableType.OLAP_EXTERNAL) {
                 OlapTable olapTable = (OlapTable) table;
                 if (olapTable.getKeysType() == KeysType.PRIMARY_KEYS) {
-                    sb.append("  ").append(column.toSqlWithoutAggregateTypeName());
+                    sb.append("  ").append(column.toSqlWithoutAggregateTypeName(table.getIdToColumn()));
                 } else {
-                    sb.append("  ").append(column.toSql());
+                    sb.append("  ").append(column.toSql(table.getIdToColumn()));
                 }
             } else {
-                sb.append("  ").append(column.toSql());
+                sb.append("  ").append(column.toSql(table.getIdToColumn()));
             }
         }
         if (table.isOlapOrCloudNativeTable() || table.getType() == Table.TableType.OLAP_EXTERNAL) {
@@ -1492,7 +1514,7 @@ public class AstToStringBuilder {
             if (CollectionUtils.isNotEmpty(olapTable.getIndexes())) {
                 for (Index index : olapTable.getIndexes()) {
                     sb.append(",\n");
-                    sb.append("  ").append(index.toSql());
+                    sb.append("  ").append(index.toSql(table));
                 }
             }
         }
@@ -1526,7 +1548,7 @@ public class AstToStringBuilder {
 
             // distribution
             DistributionInfo distributionInfo = olapTable.getDefaultDistributionInfo();
-            sb.append("\n").append(distributionInfo.toSql());
+            sb.append("\n").append(distributionInfo.toSql(table.getIdToColumn()));
 
             // order by
             MaterializedIndexMeta index = olapTable.getIndexMetaByIndexId(olapTable.getBaseIndexId());
@@ -1584,7 +1606,7 @@ public class AstToStringBuilder {
                 sb.append("PARTITION BY RANGE(");
                 idx = 0;
                 RangePartitionInfo rangePartitionInfo = (RangePartitionInfo) partitionInfo;
-                for (Column column : rangePartitionInfo.getPartitionColumns()) {
+                for (Column column : rangePartitionInfo.getPartitionColumns(table.getIdToColumn())) {
                     if (idx != 0) {
                         sb.append(", ");
                     }

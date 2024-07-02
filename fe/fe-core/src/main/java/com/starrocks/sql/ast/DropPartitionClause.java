@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.ast;
 
 import com.starrocks.alter.AlterOpType;
 import com.starrocks.sql.parser.NodePosition;
 
+import java.util.List;
 import java.util.Map;
 
 // clause which is used to add one column to
@@ -27,6 +27,11 @@ public class DropPartitionClause extends AlterTableClause {
     // true if this is to drop a temp partition
     private final boolean isTempPartition;
     private final boolean forceDrop;
+    private final MultiRangePartitionDesc multiRangePartitionDesc;
+    private final List<String> partitionNames;
+
+    //Object Resolved by Analyzer
+    private List<String> resolvedPartitionNames;
 
     public DropPartitionClause(boolean ifExists, String partitionName, boolean isTempPartition, boolean forceDrop) {
         this(ifExists, partitionName, isTempPartition, forceDrop, NodePosition.ZERO);
@@ -40,6 +45,40 @@ public class DropPartitionClause extends AlterTableClause {
         this.isTempPartition = isTempPartition;
         this.needTableStable = false;
         this.forceDrop = forceDrop;
+        this.multiRangePartitionDesc = null;
+        this.partitionNames = null;
+    }
+
+    public DropPartitionClause(boolean ifExists, List<String> partitionNames, boolean isTempPartition,
+                               boolean forceDrop, NodePosition pos) {
+        super(AlterOpType.DROP_PARTITION, pos);
+        this.ifExists = ifExists;
+        this.partitionName = null;
+        this.isTempPartition = isTempPartition;
+        this.needTableStable = false;
+        this.forceDrop = forceDrop;
+        this.multiRangePartitionDesc = null;
+        this.partitionNames = partitionNames;
+    }
+
+    public DropPartitionClause(boolean ifExists, MultiRangePartitionDesc multiRangePartitionDesc, boolean isTempPartition,
+                               boolean forceDrop, NodePosition pos) {
+        super(AlterOpType.DROP_PARTITION, pos);
+        this.ifExists = ifExists;
+        this.partitionName = null;
+        this.isTempPartition = isTempPartition;
+        this.needTableStable = false;
+        this.forceDrop = forceDrop;
+        this.multiRangePartitionDesc = multiRangePartitionDesc;
+        this.partitionNames = null;
+    }
+
+    public List<String> getResolvedPartitionNames() {
+        return resolvedPartitionNames;
+    }
+
+    public void setResolvedPartitionNames(List<String> resolvedPartitionNames) {
+        this.resolvedPartitionNames = resolvedPartitionNames;
     }
 
     public boolean isSetIfExists() {
@@ -56,6 +95,14 @@ public class DropPartitionClause extends AlterTableClause {
 
     public boolean isForceDrop() {
         return forceDrop;
+    }
+
+    public MultiRangePartitionDesc getMultiRangePartitionDesc() {
+        return multiRangePartitionDesc;
+    }
+
+    public List<String> getPartitionNames() {
+        return partitionNames;
     }
 
     @Override

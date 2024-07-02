@@ -51,6 +51,7 @@ struct DeltaWriterOptions {
     int32_t schema_hash;
     int64_t txn_id;
     int64_t partition_id;
+    int64_t sink_id;
     PUniqueId load_id;
     // slots are in order of tablet's schema
     const std::vector<SlotDescriptor*>* slots;
@@ -65,7 +66,10 @@ struct DeltaWriterOptions {
     ReplicaState replica_state;
     bool miss_auto_increment_column = false;
     PartialUpdateMode partial_update_mode = PartialUpdateMode::UNKNOWN_MODE;
-    POlapTableSchemaParam ptable_schema_param;
+    // `ptable_schema_param` is valid during initialization.
+    // And it will be set to nullptr because we only need to access it during intialization.
+    // If you need to access it after intialization, please make sure the pointer is valid.
+    const POlapTableSchemaParam* ptable_schema_param = nullptr;
     int64_t immutable_tablet_size = 0;
 };
 
@@ -162,12 +166,17 @@ public:
 
     int64_t write_buffer_size() const { return _write_buffer_size; }
 
+    static bool is_partial_update_with_sort_key_conflict(const PartialUpdateMode& partial_update_mode,
+                                                         const std::vector<int32_t>& referenced_column_ids,
+                                                         const std::vector<ColumnId>& sort_key_idxes,
+                                                         size_t num_key_columns);
+
 private:
     DeltaWriter(DeltaWriterOptions opt, MemTracker* parent, StorageEngine* storage_engine);
 
     Status _init();
     Status _flush_memtable();
-    Status _build_current_tablet_schema(int64_t index_id, const POlapTableSchemaParam& table_schema_param,
+    Status _build_current_tablet_schema(int64_t index_id, const POlapTableSchemaParam* table_schema_param,
                                         const TabletSchemaCSPtr& ori_tablet_schema);
 
     const char* _state_name(State state) const;
@@ -208,7 +217,7 @@ private:
     bool _with_rollback_log;
     // initial value is max value
     size_t _memtable_buffer_row = std::numeric_limits<size_t>::max();
-    bool _partial_schema_with_sort_key = false;
+    bool _partial_schema_with_sort_key_conflict = false;
     std::atomic<bool> _is_immutable = false;
 
     int64_t _last_write_ts = 0;

@@ -14,9 +14,9 @@
 
 package com.starrocks.lake;
 
-import autovalue.shaded.com.google.common.common.collect.Lists;
-import autovalue.shaded.com.google.common.common.collect.Sets;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import com.staros.proto.ShardGroupInfo;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.MaterializedIndex;
@@ -37,8 +37,11 @@ import com.starrocks.proto.DeleteTabletResponse;
 import com.starrocks.rpc.BrpcProxy;
 import com.starrocks.rpc.LakeService;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.system.Backend;
 import com.starrocks.system.ComputeNode;
+import com.starrocks.thrift.TStatusCode;
+import com.starrocks.warehouse.Warehouse;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -95,7 +98,11 @@ public class StarMgrMetaSyncer extends FrontendDaemon {
         // group shards by be
         for (long shardId : shardIds) {
             try {
-                long backendId = starOSAgent.getPrimaryComputeNodeIdByShard(shardId);
+                WarehouseManager manager = GlobalStateMgr.getCurrentState().getWarehouseMgr();
+                Warehouse warehouse = manager.getBackgroundWarehouse();
+                long workerGroupId = manager.selectWorkerGroupByWarehouseId(warehouse.getId())
+                        .orElse(StarOSAgent.DEFAULT_WORKER_GROUP_ID);
+                long backendId = starOSAgent.getPrimaryComputeNodeIdByShard(shardId, workerGroupId);
                 shardIdsByBeMap.computeIfAbsent(backendId, k -> Sets.newHashSet()).add(shardId);
             } catch (UserException ignored1) {
                 // ignore error
@@ -119,11 +126,16 @@ public class StarMgrMetaSyncer extends FrontendDaemon {
                 LakeService lakeService = BrpcProxy.getLakeService(node.getHost(), node.getBrpcPort());
                 DeleteTabletResponse response = lakeService.deleteTablet(request).get();
                 if (response != null && response.failedTablets != null && !response.failedTablets.isEmpty()) {
-                    LOG.info("failedTablets is {}", response.failedTablets);
-                    response.failedTablets.forEach(shards::remove);
+                    TStatusCode stCode = TStatusCode.findByValue(response.status.statusCode);
+                    LOG.info("Fail to delete tablet. StatusCode: {}, failedTablets: {}", stCode, response.failedTablets);
+
+                    // ignore INVALID_ARGUMENT error, treat it as success
+                    if (stCode != TStatusCode.INVALID_ARGUMENT) {
+                        response.failedTablets.forEach(shards::remove);
+                    }
                 }
             } catch (Throwable e) {
-                LOG.error(e);
+                LOG.error(e.getMessage(), e);
                 if (e instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                 }
@@ -206,7 +218,11 @@ public class StarMgrMetaSyncer extends FrontendDaemon {
     public int deleteUnusedWorker() {
         int cnt = 0;
         try {
-            List<String> workerAddresses = GlobalStateMgr.getCurrentState().getStarOSAgent().listDefaultWorkerGroupIpPort();
+            WarehouseManager warehouseManager = GlobalStateMgr.getCurrentState().getWarehouseMgr();
+            Warehouse warehouse = warehouseManager.getBackgroundWarehouse();
+            long workerGroupId = warehouseManager.selectWorkerGroupByWarehouseId(warehouse.getId())
+                    .orElse(StarOSAgent.DEFAULT_WORKER_GROUP_ID);
+            List<String> workerAddresses = GlobalStateMgr.getCurrentState().getStarOSAgent().listWorkerGroupIpPort(workerGroupId);
 
             // filter backend
             List<Backend> backends = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackends();
@@ -229,7 +245,7 @@ public class StarMgrMetaSyncer extends FrontendDaemon {
             }
 
             for (String unusedWorkerAddress : workerAddresses) {
-                GlobalStateMgr.getCurrentState().getStarOSAgent().removeWorker(unusedWorkerAddress);
+                GlobalStateMgr.getCurrentState().getStarOSAgent().removeWorker(unusedWorkerAddress, workerGroupId);
                 LOG.info("unused worker {} removed from star mgr", unusedWorkerAddress);
                 cnt++;
             }

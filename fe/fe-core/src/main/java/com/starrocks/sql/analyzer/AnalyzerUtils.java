@@ -44,6 +44,8 @@ import com.starrocks.analysis.Subquery;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.AggregateFunction;
 import com.starrocks.catalog.ArrayType;
+import com.starrocks.catalog.Column;
+import com.starrocks.catalog.ColumnId;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.ExpressionRangePartitionInfo;
 import com.starrocks.catalog.Function;
@@ -339,7 +341,7 @@ public class AnalyzerUtils {
         @Override
         public Void visitSetOp(SetOperationRelation node, Void context) {
             if (node.hasWithClause()) {
-                node.getRelations().forEach(this::visit);
+                node.getCteRelations().forEach(this::visit);
             }
             node.getRelations().forEach(this::visit);
             return null;
@@ -711,6 +713,12 @@ public class AnalyzerUtils {
         Map<TableName, Table> nonOlapTables = Maps.newHashMap();
         new AnalyzerUtils.NonOlapTableCollector(nonOlapTables).visit(statementBase);
         return nonOlapTables.isEmpty();
+    }
+
+    public static boolean hasTemporaryTables(StatementBase statementBase) {
+        Map<TableName, Table> tables = new HashMap<>();
+        new AnalyzerUtils.TableCollector(tables).visit(statementBase);
+        return tables.values().stream().anyMatch(t -> t.isTemporaryTable());
     }
 
     public static void copyOlapTable(StatementBase statementBase, Set<OlapTable> olapTables) {
@@ -1223,11 +1231,12 @@ public class AnalyzerUtils {
     }
 
     public static PartitionMeasure checkAndGetPartitionMeasure(
+            Map<ColumnId, Column> idToColumn,
             ExpressionRangePartitionInfo expressionRangePartitionInfo)
             throws AnalysisException {
         long interval = 1;
         String granularity;
-        List<Expr> partitionExprs = expressionRangePartitionInfo.getPartitionExprs();
+        List<Expr> partitionExprs = expressionRangePartitionInfo.getPartitionExprs(idToColumn);
 
         if (partitionExprs.size() != 1) {
             throw new AnalysisException("automatic partition only support one expression partitionExpr.");
@@ -1277,12 +1286,14 @@ public class AnalyzerUtils {
             throws AnalysisException {
         PartitionInfo partitionInfo = olapTable.getPartitionInfo();
         if (partitionInfo instanceof ExpressionRangePartitionInfo) {
-            PartitionMeasure measure = checkAndGetPartitionMeasure((ExpressionRangePartitionInfo) partitionInfo);
+            PartitionMeasure measure = checkAndGetPartitionMeasure(olapTable.getIdToColumn(),
+                    (ExpressionRangePartitionInfo) partitionInfo);
             return getAddPartitionClauseForRangePartition(olapTable, partitionValues, measure,
                     (ExpressionRangePartitionInfo) partitionInfo);
         } else if (partitionInfo instanceof ListPartitionInfo) {
             Short replicationNum = olapTable.getTableProperty().getReplicationNum();
-            DistributionDesc distributionDesc = olapTable.getDefaultDistributionInfo().toDistributionDesc();
+            DistributionDesc distributionDesc = olapTable.getDefaultDistributionInfo()
+                    .toDistributionDesc(olapTable.getIdToColumn());
             Map<String, String> partitionProperties =
                     ImmutableMap.of("replication_num", String.valueOf(replicationNum));
             String partitionPrefix = "p";
@@ -1345,10 +1356,12 @@ public class AnalyzerUtils {
             throws AnalysisException {
         String granularity = measure.getGranularity();
         long interval = measure.getInterval();
-        Type firstPartitionColumnType = expressionRangePartitionInfo.getPartitionColumns().get(0).getType();
+        Type firstPartitionColumnType = expressionRangePartitionInfo.getPartitionColumns(olapTable.getIdToColumn())
+                .get(0).getType();
         String partitionPrefix = "p";
         Short replicationNum = olapTable.getTableProperty().getReplicationNum();
-        DistributionDesc distributionDesc = olapTable.getDefaultDistributionInfo().toDistributionDesc();
+        DistributionDesc distributionDesc = olapTable.getDefaultDistributionInfo()
+                .toDistributionDesc(olapTable.getIdToColumn());
         Map<String, String> partitionProperties = ImmutableMap.of("replication_num", String.valueOf(replicationNum));
 
         List<PartitionDesc> partitionDescs = Lists.newArrayList();

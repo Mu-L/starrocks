@@ -89,9 +89,6 @@ protected:
     void _create_string_conjunct_ctxs(TExprOpcode::type opcode, SlotId slot_id, const std::string& value,
                                       std::vector<ExprContext*>* conjunct_ctxs);
 
-    void _create_in_predicate_conjunct_ctxs(TExprOpcode::type opcode, SlotId slot_id, std::set<int32_t>& values,
-                                            std::vector<ExprContext*>* conjunct_ctxs);
-
     void _create_struct_subfield_predicate_conjunct_ctxs(TExprOpcode::type opcode, SlotId slot_id,
                                                          const TypeDescriptor& type,
                                                          const std::vector<std::string>& subfiled_path,
@@ -224,6 +221,9 @@ protected:
     std::string _file_array_map_path = "./be/test/exec/test_data/parquet_scanner/hudi_array_map.parquet";
 
     std::string _file_binary_path = "./be/test/exec/test_data/parquet_scanner/file_reader_test_binary.parquet";
+
+    // The length of binary type is greater than 4k, and there is no min max statistics
+    std::string _file_no_min_max_stats_path = "./be/test/exec/test_data/parquet_scanner/no_min_max_statistics.parquet";
 
     std::shared_ptr<RowDescriptor> _row_desc = nullptr;
     RuntimeState* _runtime_state = nullptr;
@@ -675,55 +675,6 @@ void FileReaderTest::_create_int_conjunct_ctxs(TExprOpcode::type opcode, SlotId 
     ASSERT_OK(Expr::open(*conjunct_ctxs, _runtime_state));
 }
 
-void FileReaderTest::_create_in_predicate_conjunct_ctxs(TExprOpcode::type opcode, SlotId slot_id,
-                                                        std::set<int32_t>& values,
-                                                        std::vector<ExprContext*>* conjunct_ctxs) {
-    std::vector<TExprNode> nodes;
-
-    TExprNode node0;
-    node0.node_type = TExprNodeType::IN_PRED;
-    node0.opcode = opcode;
-    node0.child_type = TPrimitiveType::INT;
-    node0.num_children = values.size() + 1;
-    node0.__isset.opcode = true;
-    node0.__isset.child_type = true;
-    node0.type = gen_type_desc(TPrimitiveType::BOOLEAN);
-    nodes.emplace_back(node0);
-
-    TExprNode node1;
-    node1.node_type = TExprNodeType::SLOT_REF;
-    node1.type = gen_type_desc(TPrimitiveType::INT);
-    node1.num_children = 0;
-    TSlotRef t_slot_ref = TSlotRef();
-    t_slot_ref.slot_id = slot_id;
-    t_slot_ref.tuple_id = 0;
-    node1.__set_slot_ref(t_slot_ref);
-    node1.is_nullable = true;
-    nodes.emplace_back(node1);
-
-    for (int32_t value : values) {
-        TExprNode node;
-        node.node_type = TExprNodeType::INT_LITERAL;
-        node.type = gen_type_desc(TPrimitiveType::INT);
-        node.num_children = 0;
-        TIntLiteral int_literal;
-        int_literal.value = value;
-        node.__set_int_literal(int_literal);
-        node.is_nullable = false;
-        nodes.emplace_back(node);
-    }
-
-    TExpr t_expr;
-    t_expr.nodes = nodes;
-
-    std::vector<TExpr> t_conjuncts;
-    t_conjuncts.emplace_back(t_expr);
-
-    ASSERT_OK(Expr::create_expr_trees(&_pool, t_conjuncts, conjunct_ctxs, nullptr));
-    ASSERT_OK(Expr::prepare(*conjunct_ctxs, _runtime_state));
-    ASSERT_OK(Expr::open(*conjunct_ctxs, _runtime_state));
-}
-
 void FileReaderTest::_create_string_conjunct_ctxs(TExprOpcode::type opcode, SlotId slot_id, const std::string& value,
                                                   std::vector<ExprContext*>* conjunct_ctxs) {
     std::vector<TExprNode> nodes;
@@ -1024,8 +975,16 @@ TEST_F(FileReaderTest, TestFilterFile) {
 
 TEST_F(FileReaderTest, TestGetNextDictFilter) {
     auto file = _create_file(_file2_path);
-    auto file_reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(),
-                                                    std::filesystem::file_size(_file2_path), 100000);
+    std::shared_ptr<io::SeekableInputStream> input_stream = file->stream();
+    std::shared_ptr<io::SharedBufferedInputStream> shared_buffered_input_stream =
+            std::make_shared<io::SharedBufferedInputStream>(input_stream, file->filename(),
+                                                            std::filesystem::file_size(_file2_path));
+
+    auto wrap_file = std::make_unique<RandomAccessFile>(shared_buffered_input_stream, file->filename());
+
+    auto file_reader = std::make_shared<FileReader>(config::vector_chunk_size, wrap_file.get(),
+                                                    std::filesystem::file_size(_file2_path), 100000,
+                                                    shared_buffered_input_stream.get());
     // init
     auto* ctx = _create_context_for_dict_filter();
     Status status = file_reader->init(ctx);
@@ -1049,6 +1008,8 @@ TEST_F(FileReaderTest, TestGetNextDictFilter) {
 
     status = file_reader->get_next(&chunk);
     ASSERT_TRUE(status.is_end_of_file());
+    ASSERT_EQ(1, shared_buffered_input_stream->direct_io_count());
+    ASSERT_EQ(1, shared_buffered_input_stream->shared_io_count());
 }
 
 TEST_F(FileReaderTest, TestGetNextOtherFilter) {
@@ -2868,8 +2829,12 @@ TEST_F(FileReaderTest, TestRandomReadWith2PageSize) {
                 auto ctx = _create_file_random_read_context(file_path);
                 auto file = _create_file(file_path);
                 ctx->conjunct_ctxs_by_slot[0].clear();
-                _create_in_predicate_conjunct_ctxs(TExprOpcode::FILTER_IN, 0, in_oprands,
-                                                   &ctx->conjunct_ctxs_by_slot[0]);
+                std::vector<TExpr> t_conjuncts;
+                ParquetUTBase::create_in_predicate_int_conjunct_ctxs(TExprOpcode::FILTER_IN, 0, in_oprands,
+                                                                     &t_conjuncts);
+                ParquetUTBase::create_conjunct_ctxs(&_pool, _runtime_state, &t_conjuncts,
+                                                    &ctx->conjunct_ctxs_by_slot[0]);
+
                 auto file_reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(),
                                                                 std::filesystem::file_size(file_path), 0);
 
@@ -3197,6 +3162,109 @@ TEST_F(FileReaderTest, TestTime) {
     }
 
     EXPECT_EQ(4, total_row_nums);
+}
+
+TEST_F(FileReaderTest, TestReadNoMinMaxStatistics) {
+    auto file = _create_file(_file_no_min_max_stats_path);
+    auto file_reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(),
+                                                    std::filesystem::file_size(_file_no_min_max_stats_path), 100000);
+
+    // --------------init context---------------
+    auto ctx = _create_scan_context();
+
+    TypeDescriptor type_varchar = TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR);
+
+    Utils::SlotDesc slot_descs[] = {
+            {"attr_value", type_varchar},
+            {""},
+    };
+
+    ctx->tuple_desc = Utils::create_tuple_descriptor(_runtime_state, &_pool, slot_descs);
+    Utils::make_column_info_vector(ctx->tuple_desc, &ctx->materialized_columns);
+    ctx->scan_range = (_create_scan_range(_file_no_min_max_stats_path));
+
+    // create min max conjuncts
+    Utils::SlotDesc min_max_slots[] = {
+            {"attr_value", TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR)},
+            {""},
+    };
+    ctx->min_max_tuple_desc = Utils::create_tuple_descriptor(_runtime_state, &_pool, min_max_slots);
+    std::vector<TExpr> t_conjuncts;
+    ParquetUTBase::append_string_conjunct(TExprOpcode::GE, 0, "2", &t_conjuncts);
+    ParquetUTBase::append_string_conjunct(TExprOpcode::LE, 0, "2", &t_conjuncts);
+    ParquetUTBase::create_conjunct_ctxs(&_pool, _runtime_state, &t_conjuncts, &ctx->min_max_conjunct_ctxs);
+
+    // attr_value = '2'
+    _create_string_conjunct_ctxs(TExprOpcode::EQ, 0, "2", &ctx->conjunct_ctxs_by_slot[0]);
+    // --------------finish init context---------------
+
+    Status status = file_reader->init(ctx);
+    ASSERT_TRUE(status.ok());
+
+    EXPECT_EQ(file_reader->_row_group_readers.size(), 1);
+
+    auto chunk = std::make_shared<Chunk>();
+    chunk->append_column(ColumnHelper::create_column(type_varchar, true), chunk->num_columns());
+
+    status = file_reader->get_next(&chunk);
+    ASSERT_TRUE(status.ok());
+
+    chunk->check_or_die();
+
+    EXPECT_EQ("['2']", chunk->debug_row(0));
+    EXPECT_EQ("['2']", chunk->debug_row(1));
+    EXPECT_EQ("['2']", chunk->debug_row(2));
+    EXPECT_EQ(chunk->num_rows(), 111);
+}
+
+TEST_F(FileReaderTest, TestIsNotNullStatistics) {
+    auto file = _create_file(_file1_path);
+    auto file_reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(),
+                                                    std::filesystem::file_size(_file1_path), 100000);
+    // init
+    auto* ctx = _create_file1_base_context();
+    std::vector<TExpr> t_conjuncts;
+    ParquetUTBase::is_null_pred(0, false, &t_conjuncts);
+    ParquetUTBase::create_conjunct_ctxs(&_pool, _runtime_state, &t_conjuncts, &ctx->conjunct_ctxs_by_slot[0]);
+
+    Status status = file_reader->init(ctx);
+    ASSERT_TRUE(status.ok());
+    EXPECT_EQ(file_reader->_row_group_readers.size(), 0);
+}
+
+TEST_F(FileReaderTest, TestIsNullStatistics) {
+    const std::string small_page_file = "./be/test/formats/parquet/test_data/read_range_test.parquet";
+    auto file = _create_file(small_page_file);
+    auto file_reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(),
+                                                    std::filesystem::file_size(small_page_file), 0);
+
+    auto ctx = _create_file_random_read_context(small_page_file);
+    std::vector<TExpr> t_conjuncts;
+    ParquetUTBase::is_null_pred(0, true, &t_conjuncts);
+    ParquetUTBase::create_conjunct_ctxs(&_pool, _runtime_state, &t_conjuncts, &ctx->conjunct_ctxs_by_slot[0]);
+
+    Status status = file_reader->init(ctx);
+    ASSERT_TRUE(status.ok());
+    EXPECT_EQ(file_reader->_row_group_readers.size(), 0);
+}
+
+TEST_F(FileReaderTest, TestInFilterStatitics) {
+    // there are 4 row groups
+    const std::string multi_rg_file = "./be/test/formats/parquet/test_data/page_index_big_page.parquet";
+    auto file = _create_file(multi_rg_file);
+    auto file_reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(),
+                                                    std::filesystem::file_size(multi_rg_file), 0);
+
+    auto ctx = _create_file_random_read_context(multi_rg_file);
+    // min value and max value in this file, so it will be in the first and last row group
+    std::set<int32_t> in_oprands{1, 100000};
+    std::vector<TExpr> t_conjuncts;
+    ParquetUTBase::create_in_predicate_int_conjunct_ctxs(TExprOpcode::FILTER_IN, 0, in_oprands, &t_conjuncts);
+    ParquetUTBase::create_conjunct_ctxs(&_pool, _runtime_state, &t_conjuncts, &ctx->conjunct_ctxs_by_slot[0]);
+
+    Status status = file_reader->init(ctx);
+    ASSERT_TRUE(status.ok());
+    EXPECT_EQ(file_reader->_row_group_readers.size(), 2);
 }
 
 } // namespace starrocks::parquet

@@ -175,7 +175,7 @@ public:
     // partition slots would be [x, y]
     // partition key values wold be [1, 2]
     std::vector<ExprContext*>& partition_key_value_evals() { return _partition_key_value_evals; }
-    Status create_part_key_exprs(RuntimeState* state, ObjectPool* pool, int32_t chunk_size);
+    Status create_part_key_exprs(RuntimeState* state, ObjectPool* pool);
 
 private:
     int64_t _id = 0;
@@ -196,9 +196,9 @@ public:
     virtual bool has_base_path() const { return false; }
     virtual const std::string& get_base_path() const { return _table_location; }
 
-    Status create_key_exprs(RuntimeState* state, ObjectPool* pool, int32_t chunk_size) {
+    Status create_key_exprs(RuntimeState* state, ObjectPool* pool) {
         for (auto& part : _partition_id_to_desc_map) {
-            RETURN_IF_ERROR(part.second->create_part_key_exprs(state, pool, chunk_size));
+            RETURN_IF_ERROR(part.second->create_part_key_exprs(state, pool));
         }
         return Status::OK();
     }
@@ -332,6 +332,26 @@ private:
     std::string _time_zone;
 };
 
+class IcebergMetadataTableDescriptor : public HiveTableDescriptor {
+public:
+    IcebergMetadataTableDescriptor(const TTableDescriptor& tdesc, ObjectPool* pool);
+    ~IcebergMetadataTableDescriptor() override = default;
+    const std::string& get_hive_column_names() const;
+    const std::string& get_hive_column_types() const;
+    bool has_partition() const override { return false; }
+
+private:
+    std::string _hive_column_names;
+    std::string _hive_column_types;
+};
+
+class KuduTableDescriptor : public HiveTableDescriptor {
+public:
+    KuduTableDescriptor(const TTableDescriptor& tdesc, ObjectPool* pool);
+    ~KuduTableDescriptor() override = default;
+    bool has_partition() const override { return false; }
+};
+
 // ===========================================
 
 class OlapTableDescriptor : public TableDescriptor {
@@ -424,6 +444,15 @@ public:
     const TableDescriptor* table_desc() const { return _table_desc; }
     void set_table_desc(TableDescriptor* table_desc) { _table_desc = table_desc; }
 
+    SlotDescriptor* get_slot_by_id(SlotId id) const {
+        for (auto s : _slots) {
+            if (s->id() == id) {
+                return s;
+            }
+        }
+        return nullptr;
+    }
+
     TupleId id() const { return _id; }
 
     std::string debug_string() const;
@@ -484,15 +513,12 @@ private:
 // case)
 class RowDescriptor {
 public:
-    RowDescriptor(const DescriptorTbl& desc_tbl, const std::vector<TTupleId>& row_tuples,
-                  const std::vector<bool>& nullable_tuples);
+    RowDescriptor(const DescriptorTbl& desc_tbl, const std::vector<TTupleId>& row_tuples);
 
     // standard copy c'tor, made explicit here
-    RowDescriptor(const RowDescriptor& desc)
+    RowDescriptor(const RowDescriptor& desc) = default;
 
-            = default;
-
-    RowDescriptor(TupleDescriptor* tuple_desc, bool is_nullable);
+    RowDescriptor(TupleDescriptor* tuple_desc);
 
     // dummy descriptor, needed for the JNI EvalPredicate() function
     RowDescriptor() = default;
@@ -524,9 +550,6 @@ private:
 
     // map from position of tuple w/in row to its descriptor
     std::vector<TupleDescriptor*> _tuple_desc_map;
-
-    // _tuple_idx_nullable_map[i] is true if tuple i can be null
-    std::vector<bool> _tuple_idx_nullable_map;
 
     // map from TupleId to position of tuple w/in row
     std::vector<int> _tuple_idx_map;

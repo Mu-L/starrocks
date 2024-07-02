@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #include "exec/pipeline/fragment_context.h"
@@ -93,6 +94,7 @@ public:
     void set_enable_pipeline_level_shuffle(bool flag) { _enable_pipeline_level_shuffle = flag; }
     bool enable_pipeline_level_shuffle() { return _enable_pipeline_level_shuffle; }
     void set_enable_profile() { _enable_profile = true; }
+    bool get_enable_profile_flag() { return _enable_profile; }
     bool enable_profile() {
         if (_enable_profile) {
             return true;
@@ -126,6 +128,7 @@ public:
         }
         _big_query_profile_threshold_ns = factor * big_query_profile_threshold;
     }
+    int64_t get_big_query_profile_threshold_ns() const { return _big_query_profile_threshold_ns; }
     void set_runtime_profile_report_interval(int64_t runtime_profile_report_interval_s) {
         _runtime_profile_report_interval_ns = 1'000'000'000L * runtime_profile_report_interval_s;
     }
@@ -145,17 +148,14 @@ public:
         _desc_tbl = desc_tbl;
     }
 
-    DescriptorTbl* desc_tbl() {
-        DCHECK(_desc_tbl != nullptr);
-        return _desc_tbl;
-    }
+    DescriptorTbl* desc_tbl() { return _desc_tbl; }
 
     size_t total_fragments() { return _total_fragments; }
     /// Initialize the mem_tracker of this query.
     /// Positive `big_query_mem_limit` and non-null `wg` indicate
     /// that there is a big query memory limit of this resource group.
     void init_mem_tracker(int64_t query_mem_limit, MemTracker* parent, int64_t big_query_mem_limit = -1,
-                          int64_t spill_mem_limit = -1, workgroup::WorkGroup* wg = nullptr,
+                          std::optional<double> spill_mem_limit = std::nullopt, workgroup::WorkGroup* wg = nullptr,
                           RuntimeState* state = nullptr);
     std::shared_ptr<MemTracker> mem_tracker() { return _mem_tracker; }
     MemTracker* connector_scan_mem_tracker() { return _connector_scan_mem_tracker.get(); }

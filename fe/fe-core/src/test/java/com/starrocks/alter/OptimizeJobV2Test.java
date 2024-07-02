@@ -23,6 +23,7 @@ import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.OlapTable.OlapTableState;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Replica;
+import com.starrocks.common.Config;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.scheduler.Constants;
 import com.starrocks.server.GlobalStateMgr;
@@ -62,11 +63,13 @@ public class OptimizeJobV2Test extends DDLTestBase {
         super.setUp();
         String stmt = "alter table testTable7 distributed by hash(v1)";
         alterTableStmt = (AlterTableStmt) UtFrameUtils.parseStmtWithNewParser(stmt, starRocksAssert.getCtx());
+        Config.enable_online_optimize_table = false;
     }
 
     @After
     public void clear() {
         GlobalStateMgr.getCurrentState().getSchemaChangeHandler().clearJobs();
+        Config.enable_online_optimize_table = true;
     }
 
     @Test
@@ -255,20 +258,6 @@ public class OptimizeJobV2Test extends DDLTestBase {
         replica1.setState(Replica.ReplicaState.NORMAL);
         optimizeJob.runPendingJob();
         Assert.assertEquals(JobState.WAITING_TXN, optimizeJob.getJobState());
-
-        // runWaitingTxnJob
-        optimizeJob.runWaitingTxnJob();
-        Assert.assertEquals(JobState.RUNNING, optimizeJob.getJobState());
-
-        // runRunningJob
-        List<OptimizeTask> optimizeTasks = optimizeJob.getOptimizeTasks();
-        for (OptimizeTask optimizeTask : optimizeTasks) {
-            optimizeTask.setOptimizeTaskState(Constants.TaskRunState.SUCCESS);
-        }
-        optimizeJob.runRunningJob();
-
-        // finish alter tasks
-        Assert.assertEquals(JobState.FINISHED, optimizeJob.getJobState());
     }
 
     @Test

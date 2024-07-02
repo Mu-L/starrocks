@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.connector.iceberg.cost;
 
 import com.google.common.collect.AbstractSequentialIterator;
 import com.google.common.collect.HashMultimap;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.IcebergTable;
+import com.starrocks.connector.PredicateSearchKey;
 import com.starrocks.connector.exception.StarRocksConnectorException;
-import com.starrocks.connector.iceberg.IcebergFilter;
 import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
@@ -69,8 +68,8 @@ public class IcebergStatisticProvider {
 
     // table uuid -> <partition column id -> partition column values>
     private final Map<String, HashMultimap<Integer, Object>> uuidToPartitionFieldIdToValues = new HashMap<>();
-    private final Map<IcebergFilter, IcebergFileStats> icebergFileStatistics = new HashMap<>();
-    private final Map<IcebergFilter, Set<String>> scannedFiles = new HashMap<>();
+    private final Map<PredicateSearchKey, IcebergFileStats> icebergFileStatistics = new HashMap<>();
+    private final Map<PredicateSearchKey, Set<String>> scannedFiles = new HashMap<>();
 
     public IcebergStatisticProvider() {
     }
@@ -125,7 +124,7 @@ public class IcebergStatisticProvider {
                 }
             }
 
-            IcebergFilter key = IcebergFilter.of(icebergTable.getRemoteDbName(), icebergTable.getRemoteTableName(),
+            PredicateSearchKey key = PredicateSearchKey.of(icebergTable.getRemoteDbName(), icebergTable.getRemoteTableName(),
                     snapshot.get().snapshotId(), predicate);
             IcebergFileStats icebergFileStats;
             if (!icebergFileStatistics.containsKey(key)) {
@@ -152,7 +151,7 @@ public class IcebergStatisticProvider {
     public void updateIcebergFileStats(IcebergTable icebergTable, FileScanTask fileScanTask,
                                        Map<Integer, Type.PrimitiveType> idToTypeMapping,
                                        List<Types.NestedField> nonPartitionPrimitiveColumns,
-                                       IcebergFilter key) {
+                                       PredicateSearchKey key) {
         String uuid = icebergTable.getUUID();
 
         Table nativeTable = icebergTable.getNativeTable();
@@ -243,6 +242,14 @@ public class IcebergStatisticProvider {
 
             columnStatistics.put(columnList.get(0), buildColumnStatistic(
                     idColumn.getKey(), colRefToColumnMetaMap.get(columnList.get(0)), icebergFileStats, colIdToNdv));
+        }
+
+        // when we rewrit plan, we will add some artificial columns which not eixst in iceberg table,
+        // and we will mark those columns as unknown column statistics.
+        for (ColumnRefOperator c : colRefToColumnMetaMap.keySet()) {
+            if (!columnStatistics.containsKey(c)) {
+                columnStatistics.put(c, ColumnStatistic.unknown());
+            }
         }
 
         return columnStatistics;

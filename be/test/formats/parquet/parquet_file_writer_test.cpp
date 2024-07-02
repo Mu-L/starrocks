@@ -235,19 +235,71 @@ TEST_F(ParquetFileWriterTest, TestWriteDecimal) {
     auto chunk = std::make_shared<Chunk>();
     {
         auto col0 = ColumnHelper::create_column(type_descs[0], true);
-        std::vector<int32_t> int32_nums{INT32_MIN, INT32_MAX, 0, 1};
+        std::vector<int32_t> int32_nums{-999999, 999999, 0, 1};
         auto count = col0->append_numbers(int32_nums.data(), size(int32_nums) * sizeof(int32_t));
         ASSERT_EQ(4, count);
         chunk->append_column(col0, chunk->num_columns());
 
         auto col1 = ColumnHelper::create_column(type_descs[1], true);
-        std::vector<int64_t> int64_nums{INT64_MIN, INT64_MAX, 0, 1};
+        std::vector<int64_t> int64_nums{-999999999999, 999999999999, 0, 1};
         count = col1->append_numbers(int64_nums.data(), size(int64_nums) * sizeof(int64_t));
         ASSERT_EQ(4, count);
         chunk->append_column(col1, chunk->num_columns());
 
         auto col2 = ColumnHelper::create_column(type_descs[2], true);
-        std::vector<int128_t> int128_nums{INT64_MIN, INT64_MAX, 0, 1};
+        std::vector<int128_t> int128_nums{-999999999999, 999999999999, 0, 1};
+        count = col2->append_numbers(int128_nums.data(), size(int128_nums) * sizeof(int128_t));
+        ASSERT_EQ(4, count);
+        chunk->append_column(col2, chunk->num_columns());
+    }
+
+    // write chunk
+    ASSERT_TRUE(writer->write(chunk).get().ok());
+    auto result = writer->commit().get();
+
+    ASSERT_TRUE(result.io_status.ok());
+    ASSERT_EQ(result.file_statistics.record_count, 4);
+
+    auto read_chunk = _read_chunk(type_descs);
+    ASSERT_TRUE(read_chunk != nullptr);
+    ASSERT_EQ(read_chunk->num_rows(), 4);
+    parquet::Utils::assert_equal_chunk(chunk.get(), read_chunk.get());
+}
+
+TEST_F(ParquetFileWriterTest, TestWriteDecimalCompatibleWithHiveReader) {
+    std::vector<TypeDescriptor> type_descs{
+            TypeDescriptor::create_decimalv3_type(TYPE_DECIMAL32, 9, 5),
+            TypeDescriptor::create_decimalv3_type(TYPE_DECIMAL64, 18, 9),
+            TypeDescriptor::create_decimalv3_type(TYPE_DECIMAL128, 20, 1),
+    };
+
+    auto column_names = _make_type_names(type_descs);
+    auto output_file = _fs.new_writable_file(_file_path).value();
+    auto output_stream = std::make_unique<parquet::ParquetOutputStream>(std::move(output_file));
+    auto column_evaluators = ColumnSlotIdEvaluator::from_types(type_descs);
+    auto writer_options = std::make_shared<formats::ParquetWriterOptions>();
+    writer_options->use_legacy_decimal_encoding = true;
+    auto writer = std::make_unique<formats::ParquetFileWriter>(
+            _file_path, std::move(output_stream), column_names, type_descs, std::move(column_evaluators),
+            TCompressionType::NO_COMPRESSION, writer_options, []() {}, nullptr, nullptr);
+    ASSERT_OK(writer->init());
+
+    auto chunk = std::make_shared<Chunk>();
+    {
+        auto col0 = ColumnHelper::create_column(type_descs[0], true);
+        std::vector<int32_t> int32_nums{-999999, 999999, 0, 1};
+        auto count = col0->append_numbers(int32_nums.data(), size(int32_nums) * sizeof(int32_t));
+        ASSERT_EQ(4, count);
+        chunk->append_column(col0, chunk->num_columns());
+
+        auto col1 = ColumnHelper::create_column(type_descs[1], true);
+        std::vector<int64_t> int64_nums{-999999999999, 999999999999, 0, 1};
+        count = col1->append_numbers(int64_nums.data(), size(int64_nums) * sizeof(int64_t));
+        ASSERT_EQ(4, count);
+        chunk->append_column(col1, chunk->num_columns());
+
+        auto col2 = ColumnHelper::create_column(type_descs[2], true);
+        std::vector<int128_t> int128_nums{-999999999999, 999999999999, 0, 1};
         count = col2->append_numbers(int128_nums.data(), size(int128_nums) * sizeof(int128_t));
         ASSERT_EQ(4, count);
         chunk->append_column(col2, chunk->num_columns());
@@ -443,6 +495,57 @@ TEST_F(ParquetFileWriterTest, TestWriteDatetime) {
     auto output_stream = std::make_unique<parquet::ParquetOutputStream>(std::move(output_file));
     auto column_evaluators = ColumnSlotIdEvaluator::from_types(type_descs);
     auto writer_options = std::make_shared<formats::ParquetWriterOptions>();
+    auto writer = std::make_unique<formats::ParquetFileWriter>(
+            _file_path, std::move(output_stream), column_names, type_descs, std::move(column_evaluators),
+            TCompressionType::NO_COMPRESSION, writer_options, []() {}, nullptr, nullptr);
+    ASSERT_OK(writer->init());
+
+    auto chunk = std::make_shared<Chunk>();
+    {
+        // not-null column
+        auto data_column = TimestampColumn::create();
+        {
+            Datum datum;
+            datum.set_timestamp(TimestampValue::create(2023, 9, 9, 23, 59, 59));
+            data_column->append_datum(datum);
+            datum.set_timestamp(TimestampValue::create(1999, 9, 10, 1, 1, 1));
+            data_column->append_datum(datum);
+            datum.set_timestamp(TimestampValue::create(1970, 1, 1, 0, 0, 0));
+            data_column->append_datum(datum);
+            datum.set_timestamp(TimestampValue::create(1970, 1, 1, 1, 1, 1));
+            data_column->append_datum(datum);
+        }
+
+        auto null_column = UInt8Column::create();
+        std::vector<uint8_t> nulls = {0, 0, 0, 0};
+        null_column->append_numbers(nulls.data(), nulls.size());
+        auto nullable_column = NullableColumn::create(data_column, null_column);
+        chunk->append_column(nullable_column, chunk->num_columns());
+    }
+
+    // write chunk
+    ASSERT_TRUE(writer->write(chunk).get().ok());
+    auto result = writer->commit().get();
+
+    ASSERT_TRUE(result.io_status.ok());
+    ASSERT_EQ(result.file_statistics.record_count, 4);
+
+    auto read_chunk = _read_chunk(type_descs);
+    ASSERT_TRUE(read_chunk != nullptr);
+    ASSERT_EQ(read_chunk->num_rows(), 4);
+    parquet::Utils::assert_equal_chunk(chunk.get(), read_chunk.get());
+}
+
+TEST_F(ParquetFileWriterTest, TestWriteDatetimeCompatibleWithHiveReader) {
+    auto type_datetime = TypeDescriptor::from_logical_type(TYPE_DATETIME);
+    std::vector<TypeDescriptor> type_descs{type_datetime};
+
+    auto column_names = _make_type_names(type_descs);
+    auto output_file = _fs.new_writable_file(_file_path).value();
+    auto output_stream = std::make_unique<parquet::ParquetOutputStream>(std::move(output_file));
+    auto column_evaluators = ColumnSlotIdEvaluator::from_types(type_descs);
+    auto writer_options = std::make_shared<formats::ParquetWriterOptions>();
+    writer_options->use_int96_timestamp_encoding = true;
     auto writer = std::make_unique<formats::ParquetFileWriter>(
             _file_path, std::move(output_stream), column_names, type_descs, std::move(column_evaluators),
             TCompressionType::NO_COMPRESSION, writer_options, []() {}, nullptr, nullptr);
@@ -713,6 +816,62 @@ TEST_F(ParquetFileWriterTest, TestWriteMap) {
     parquet::Utils::assert_equal_chunk(chunk.get(), read_chunk.get());
 }
 
+TEST_F(ParquetFileWriterTest, TestWriteMapOfNullKey) {
+    // type_descs
+    std::vector<TypeDescriptor> type_descs;
+    auto type_int_key = TypeDescriptor::from_logical_type(TYPE_INT);
+    auto type_int_value = TypeDescriptor::from_logical_type(TYPE_INT);
+    auto type_int_map = TypeDescriptor::from_logical_type(TYPE_MAP);
+    type_int_map.children.push_back(type_int_key);
+    type_int_map.children.push_back(type_int_value);
+    type_descs.push_back(type_int_map);
+
+    auto column_names = _make_type_names(type_descs);
+    auto output_file = _fs.new_writable_file(_file_path).value();
+    auto output_stream = std::make_unique<parquet::ParquetOutputStream>(std::move(output_file));
+    auto column_evaluators = ColumnSlotIdEvaluator::from_types(type_descs);
+    auto writer_options = std::make_shared<formats::ParquetWriterOptions>();
+    auto writer = std::make_unique<formats::ParquetFileWriter>(
+            _file_path, std::move(output_stream), column_names, type_descs, std::move(column_evaluators),
+            TCompressionType::NO_COMPRESSION, writer_options, []() {}, nullptr, nullptr);
+    ASSERT_OK(writer->init());
+
+    // [NULL -> 1], NULL, [], [2 -> 2, 3 -> NULL, 4 -> 4]
+    auto chunk = std::make_shared<Chunk>();
+    {
+        auto key_data_col = Int32Column::create();
+        std::vector<int32_t> key_nums{1, 2, 3, 4};
+        key_data_col->append_numbers(key_nums.data(), sizeof(int32_t) * key_nums.size());
+        auto key_null_col = UInt8Column::create();
+        std::vector<uint8_t> key_nulls{1, 0, 0, 0};
+        key_null_col->append_numbers(key_nulls.data(), sizeof(uint8_t) * key_nulls.size());
+        auto key_col = NullableColumn::create(key_data_col, key_null_col);
+
+        auto value_data_col = Int32Column::create();
+        std::vector<int32_t> value_nums{1, 2, -99, 4};
+        value_data_col->append_numbers(value_nums.data(), sizeof(int32_t) * value_nums.size());
+        auto value_null_col = UInt8Column::create();
+        std::vector<uint8_t> value_nulls{0, 0, 1, 0};
+        value_null_col->append_numbers(value_nulls.data(), sizeof(uint8_t) * value_nulls.size());
+        auto value_col = NullableColumn::create(value_data_col, value_null_col);
+
+        auto offsets_col = UInt32Column::create();
+        std::vector<uint32_t> offsets{0, 1, 1, 1, 4};
+        offsets_col->append_numbers(offsets.data(), sizeof(uint32_t) * offsets.size());
+        auto map_col = MapColumn::create(key_col, value_col, offsets_col);
+
+        std::vector<uint8_t> _nulls{0, 1, 0, 0};
+        auto null_col = UInt8Column::create();
+        null_col->append_numbers(_nulls.data(), sizeof(uint8_t) * _nulls.size());
+        auto nullable_col = NullableColumn::create(map_col, null_col);
+
+        chunk->append_column(nullable_col, chunk->num_columns());
+    }
+
+    // write chunk
+    ASSERT_FALSE(writer->write(chunk).get().ok());
+}
+
 TEST_F(ParquetFileWriterTest, TestWriteNestedArray) {
     // type_descs
     std::vector<TypeDescriptor> type_descs;
@@ -872,7 +1031,7 @@ TEST_F(ParquetFileWriterTest, TestFlushRowgroupWithExecutors) {
     auto executors = PriorityThreadPool("test", 1, 10);
     auto writer = std::make_unique<formats::ParquetFileWriter>(
             _file_path, std::move(output_stream), column_names, type_descs, std::move(column_evaluators),
-            TCompressionType::NO_COMPRESSION, writer_options, []() {}, nullptr, nullptr);
+            TCompressionType::NO_COMPRESSION, writer_options, []() {}, &executors, nullptr);
     ASSERT_OK(writer->init());
 
     auto chunk = std::make_shared<Chunk>();
@@ -894,6 +1053,41 @@ TEST_F(ParquetFileWriterTest, TestFlushRowgroupWithExecutors) {
 
     ASSERT_TRUE(result.io_status.ok());
     ASSERT_EQ(result.file_statistics.record_count, 8);
+}
+
+TEST_F(ParquetFileWriterTest, TestFlushRowgroupAndCommitDependency) {
+    auto type_bool = TypeDescriptor::from_logical_type(TYPE_BOOLEAN);
+    std::vector<TypeDescriptor> type_descs{type_bool};
+
+    auto column_names = _make_type_names(type_descs);
+    auto output_file = _fs.new_writable_file(_file_path).value();
+    auto output_stream = std::make_unique<parquet::ParquetOutputStream>(std::move(output_file));
+    auto column_evaluators = ColumnSlotIdEvaluator::from_types(type_descs);
+    auto writer_options = std::make_shared<formats::ParquetWriterOptions>();
+    writer_options->rowgroup_size = 1;
+    auto executors = PriorityThreadPool("test", 2, 10);
+    auto writer = std::make_unique<formats::ParquetFileWriter>(
+            _file_path, std::move(output_stream), column_names, type_descs, std::move(column_evaluators),
+            TCompressionType::NO_COMPRESSION, writer_options, []() {}, &executors, nullptr);
+    ASSERT_OK(writer->init());
+
+    auto chunk = std::make_shared<Chunk>();
+    {
+        auto data_column = BooleanColumn::create();
+        std::vector<uint8_t> values = {0, 1, 1, 0};
+        data_column->append_numbers(values.data(), values.size() * sizeof(uint8_t));
+        auto null_column = UInt8Column::create();
+        std::vector<uint8_t> nulls = {1, 0, 1, 0};
+        null_column->append_numbers(nulls.data(), nulls.size());
+        auto nullable_column = NullableColumn::create(data_column, null_column);
+        chunk->append_column(nullable_column, chunk->num_columns());
+    }
+
+    auto f = writer->write(chunk);
+    auto result = writer->commit().get();
+    ASSERT_TRUE(f.get().ok());
+    ASSERT_TRUE(result.io_status.ok());
+    ASSERT_EQ(result.file_statistics.record_count, 4);
 }
 
 TEST_F(ParquetFileWriterTest, TestWriteWithFieldID) {
@@ -930,6 +1124,21 @@ TEST_F(ParquetFileWriterTest, TestWriteWithFieldID) {
 
     ASSERT_TRUE(result.io_status.ok());
     ASSERT_EQ(result.file_statistics.record_count, 8);
+}
+
+TEST_F(ParquetFileWriterTest, TestUnknownCompression) {
+    auto type_bool = TypeDescriptor::from_logical_type(TYPE_BOOLEAN);
+    std::vector<TypeDescriptor> type_descs{type_bool};
+
+    auto column_names = _make_type_names(type_descs);
+    auto output_file = _fs.new_writable_file(_file_path).value();
+    auto output_stream = std::make_unique<parquet::ParquetOutputStream>(std::move(output_file));
+    auto column_evaluators = ColumnSlotIdEvaluator::from_types(type_descs);
+    auto writer_options = std::make_shared<formats::ParquetWriterOptions>();
+    auto writer = std::make_unique<formats::ParquetFileWriter>(
+            _file_path, std::move(output_stream), column_names, type_descs, std::move(column_evaluators),
+            TCompressionType::UNKNOWN_COMPRESSION, writer_options, []() {}, nullptr, nullptr);
+    ASSERT_ERROR(writer->init());
 }
 
 TEST_F(ParquetFileWriterTest, TestFactory) {

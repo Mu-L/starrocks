@@ -58,6 +58,7 @@ CONF_Int32(brpc_max_connections_per_server, "1");
 // this is a list in semicolon-delimited format, in CIDR notation, e.g. 10.10.10.0/24
 // If no ip match this rule, will choose one randomly.
 CONF_String(priority_networks, "");
+CONF_Bool(net_use_ipv6_when_priority_networks_empty, "false");
 
 CONF_mBool(enable_auto_adjust_pagecache, "true");
 // Memory urget water level, if the memory usage exceeds this level, reduce the size of
@@ -160,7 +161,7 @@ CONF_String(sys_log_dir, "${STARROCKS_HOME}/log");
 // The user function dir.
 CONF_String(user_function_dir, "${STARROCKS_HOME}/lib/udf");
 // The sys log level, INFO, WARNING, ERROR, FATAL.
-CONF_String(sys_log_level, "INFO");
+CONF_mString(sys_log_level, "INFO");
 // TIME-DAY, TIME-HOUR, SIZE-MB-nnn
 CONF_String(sys_log_roll_mode, "SIZE-MB-1024");
 // The log roll num.
@@ -291,7 +292,7 @@ CONF_mInt64(base_compaction_interval_seconds_since_last_operation, "86400");
 // cumulative compaction policy: max delta file's size unit:B
 CONF_mInt32(cumulative_compaction_check_interval_seconds, "1");
 CONF_mInt64(min_cumulative_compaction_num_singleton_deltas, "5");
-CONF_mInt64(max_cumulative_compaction_num_singleton_deltas, "1000");
+CONF_mInt64(max_cumulative_compaction_num_singleton_deltas, "500");
 // This config is to limit the max concurrency of running cumulative compaction tasks.
 // -1 means no limit if enable event_based_compaction_framework, and the max concurrency will be:
 CONF_Int32(cumulative_compaction_num_threads_per_disk, "1");
@@ -312,7 +313,7 @@ CONF_mInt32(update_compaction_per_tablet_min_interval_seconds, "120"); // 2min
 // if this value is 0, auto chunk size calculation algorithm will be used
 // set this value to none zero if auto algorithm isn't working well
 CONF_mInt32(update_compaction_chunk_size_for_row_store, "0");
-CONF_mInt64(max_update_compaction_num_singleton_deltas, "1000");
+CONF_mInt64(max_update_compaction_num_singleton_deltas, "500");
 CONF_mInt64(update_compaction_size_threshold, "268435456");
 CONF_mInt64(update_compaction_result_bytes, "1073741824");
 // This config controls the io amp ratio of delvec files.
@@ -379,7 +380,8 @@ CONF_mInt64(load_error_log_reserve_hours, "48");
 CONF_mInt32(number_tablet_writer_threads, "16");
 CONF_mInt64(max_queueing_memtable_per_tablet, "2");
 // when memory limit exceed and memtable last update time exceed this time, memtable will be flushed
-CONF_mInt64(stale_memtable_flush_time_sec, "30");
+// 0 means disable
+CONF_mInt64(stale_memtable_flush_time_sec, "0");
 
 // delta writer hang after this time, be will exit since storage is in error state
 CONF_Int32(be_exit_after_disk_write_hang_second, "60");
@@ -433,6 +435,10 @@ CONF_Int32(make_snapshot_rpc_timeout_ms, "20000");
 // CONF_Int32(tablet_writer_rpc_timeout_sec, "600");
 // OlapTableSink sender's send interval, should be less than the real response time of a tablet writer rpc.
 CONF_mInt32(olap_table_sink_send_interval_ms, "10");
+
+CONF_Bool(enable_load_segment_parallel, "false");
+CONF_Int32(load_segment_thread_pool_num_max, "128");
+CONF_Int32(load_segment_thread_pool_queue_size, "10240");
 
 // Fragment thread pool
 CONF_Int32(fragment_pool_thread_num_min, "64");
@@ -509,6 +515,7 @@ CONF_mInt64(write_buffer_size, "104857600");
 // impact the load performace when user upgrading StarRocks.
 // user should set these configs properly if necessary.
 CONF_Int32(query_max_memory_limit_percent, "90");
+CONF_Double(query_pool_spill_mem_limit_threshold, "1.0");
 CONF_Int64(load_process_max_memory_limit_bytes, "107374182400"); // 100GB
 CONF_Int32(load_process_max_memory_limit_percent, "30");         // 30%
 CONF_mBool(enable_new_load_on_memory_limit_exceeded, "true");
@@ -607,6 +614,10 @@ CONF_mDouble(storage_high_usage_disk_protect_ratio, "0.1"); // 10%
 // Number of thread for flushing memtable per store.
 CONF_mInt32(flush_thread_num_per_store, "2");
 
+// Number of thread for flushing memtable per store in shared-data mode.
+// Default value is cpu cores * 2
+CONF_mInt32(lake_flush_thread_num_per_store, "0");
+
 // Config for tablet meta checkpoint.
 CONF_mInt32(tablet_meta_checkpoint_min_new_rowsets_num, "10");
 CONF_mInt32(tablet_meta_checkpoint_min_interval_secs, "600");
@@ -617,6 +628,12 @@ CONF_Int64(brpc_max_body_size, "2147483648");
 CONF_Int64(brpc_socket_max_unwritten_bytes, "1073741824");
 // brpc connection types, "single", "pooled", "short".
 CONF_String_enum(brpc_connection_type, "single", "single,pooled,short");
+// If the amount of data to be sent by a single channel of brpc exceeds brpc_socket_max_unwritten_bytes
+// it will cause rpc to report an error. We add configuration to ignore rpc overload.
+// This may cause process memory usage to rise.
+// In the future we need to count the memory on each channel of the rpc. To do application layer rpc flow limiting.
+CONF_mBool(brpc_query_ignore_overcrowded, "false");
+CONF_mBool(brpc_load_ignore_overcrowded, "true");
 
 // Max number of txns for every txn_partition_map in txn manager.
 // this is a self-protection to avoid too many txns saving in manager.
@@ -756,7 +773,7 @@ CONF_Int32(pipeline_analytic_max_buffer_size, "128");
 CONF_Int32(pipeline_analytic_removable_chunk_num, "128");
 CONF_Bool(pipeline_analytic_enable_streaming_process, "true");
 CONF_Bool(pipeline_analytic_enable_removable_cumulative_process, "true");
-
+CONF_Int32(pipline_limit_max_delivery, "4096");
 /// For parallel scan on the single tablet.
 // These three configs are used to calculate the minimum number of rows picked up from a segment at one time.
 // It is `splitted_scan_bytes/scan_row_bytes` and restricted in the range [min_splitted_scan_rows, max_splitted_scan_rows].
@@ -769,6 +786,9 @@ CONF_mInt64(tablet_internal_parallel_max_splitted_scan_bytes, "536870912");
 // Only when scan_dop is not less than min_scan_dop, this table can use tablet internal parallel,
 // where scan_dop = estimated_scan_rows / splitted_scan_rows.
 CONF_mInt64(tablet_internal_parallel_min_scan_dop, "4");
+
+// Only the num rows of lake tablet less than lake_tablet_rows_splitted_ratio * splitted_scan_rows, than the lake tablet can be splitted.
+CONF_mDouble(lake_tablet_rows_splitted_ratio, "1.5");
 
 // The bitmap serialize version.
 CONF_Int16(bitmap_serialize_version, "1");
@@ -814,6 +834,9 @@ CONF_Int64(object_storage_request_timeout_ms, "-1");
 CONF_Strings(fallback_to_hadoop_fs_list, "");
 CONF_Strings(s3_compatible_fs_list, "s3n://, s3a://, s3://, oss://, cos://, cosn://, obs://, ks3://, tos://");
 
+// Lake
+CONF_mBool(io_coalesce_lake_read_enable, "false");
+
 // orc reader
 CONF_Bool(enable_orc_late_materialization, "true");
 CONF_Bool(enable_orc_libdeflate_decompression, "true");
@@ -831,6 +854,7 @@ CONF_Int32(orc_loading_buffer_size, "8388608");
 CONF_mBool(parquet_coalesce_read_enable, "true");
 CONF_Bool(parquet_late_materialization_enable, "true");
 CONF_Bool(parquet_page_index_enable, "true");
+CONF_mBool(parquet_statistics_process_more_filter_enable, "true");
 
 CONF_Int32(io_coalesce_read_max_buffer_size, "8388608");
 CONF_Int32(io_coalesce_read_max_distance_size, "1048576");
@@ -867,7 +891,7 @@ CONF_String(aws_sdk_logging_trace_level, "trace");
 // to Authenticate because the request URL does not translate these special characters.
 // This is critical for Hive partitioned tables. The object key usually contains '=' like 'dt=20230101'.
 // Enabling RFC-3986 encoding will make sure these characters are properly encoded.
-CONF_mBool(aws_sdk_enable_compliant_rfc3986_encoding, "false");
+CONF_Bool(aws_sdk_enable_compliant_rfc3986_encoding, "false");
 
 // default: 16MB
 CONF_mInt64(experimental_s3_max_single_part_size, "16777216");
@@ -924,9 +948,9 @@ CONF_mInt32(starlet_cache_evict_throughput_mb, "200");
 // Only support in S3/HDFS currently.
 CONF_mInt32(starlet_fs_stream_buffer_size_bytes, "1048576");
 CONF_mBool(starlet_use_star_cache, "true");
-// TODO: support runtime change
-CONF_Int32(starlet_star_cache_mem_size_percent, "0");
-CONF_Int64(starlet_star_cache_mem_size_bytes, "134217728");
+CONF_Bool(starlet_star_cache_async_init, "true");
+CONF_mInt32(starlet_star_cache_mem_size_percent, "0");
+CONF_mInt64(starlet_star_cache_mem_size_bytes, "134217728");
 CONF_Int32(starlet_star_cache_disk_size_percent, "80");
 CONF_Int64(starlet_star_cache_disk_size_bytes, "0");
 CONF_Int32(starlet_star_cache_block_size_bytes, "1048576");
@@ -949,6 +973,8 @@ CONF_mInt32(starlet_delete_files_max_key_in_batch, "1000");
 CONF_mInt64(lake_metadata_cache_limit, /*2GB=*/"2147483648");
 CONF_mBool(lake_print_delete_log, "false");
 CONF_mInt64(lake_compaction_stream_buffer_size_bytes, "1048576"); // 1MB
+// The interval to check whether lake compaction is valid. Set to <= 0 to disable the check.
+CONF_mInt32(lake_compaction_check_valid_interval_minutes, "30"); // 30 minutes
 // Used to ensure service availability in extreme situations by sacrificing a certain degree of correctness
 CONF_mBool(experimental_lake_ignore_lost_segment, "false");
 CONF_mInt64(experimental_lake_wait_per_put_ms, "0");
@@ -959,13 +985,19 @@ CONF_mInt64(lake_publish_version_slow_log_ms, "1000");
 CONF_mBool(lake_enable_publish_version_trace_log, "false");
 CONF_mString(lake_vacuum_retry_pattern, "*request rate*");
 CONF_mInt64(lake_vacuum_retry_max_attempts, "5");
-CONF_mInt64(lake_vacuum_retry_min_delay_ms, "10");
+CONF_mInt64(lake_vacuum_retry_min_delay_ms, "100");
 CONF_mInt64(lake_max_garbage_version_distance, "100");
 CONF_mBool(enable_primary_key_recover, "false");
 CONF_mBool(lake_enable_compaction_async_write, "false");
-CONF_mInt64(lake_pk_compaction_max_input_rowsets, "1000");
+CONF_mInt64(lake_pk_compaction_max_input_rowsets, "500");
+CONF_mInt64(lake_pk_compaction_min_input_segments, "5");
 // Used for control memory usage of update state cache and compaction state cache
 CONF_mInt32(lake_pk_preload_memory_limit_percent, "30");
+CONF_mInt32(lake_pk_index_sst_min_compaction_versions, "2");
+CONF_mInt32(lake_pk_index_sst_max_compaction_versions, "100");
+// When the ratio of cumulative level to base level is greater than this config, use base merge.
+CONF_mDouble(lake_pk_index_cumulative_base_compaction_ratio, "0.1");
+CONF_Int32(lake_pk_index_block_cache_limit_percent, "10");
 
 CONF_mBool(dependency_librdkafka_debug_enable, "false");
 
@@ -1010,6 +1042,8 @@ CONF_Int64(spill_max_log_block_container_bytes, "10737418240"); // 10GB
 // be the same with storage path. Spill will return with error when used size has exceeded
 // the limit.
 CONF_mDouble(spill_max_dir_bytes_ratio, "0.8"); // 80%
+// min bytes size of spill read buffer. if the buffer size is less than this value, we will disable buffer read
+CONF_Int64(spill_read_buffer_min_bytes, "1048576");
 
 CONF_Int32(internal_service_query_rpc_thread_num, "-1");
 
@@ -1029,16 +1063,16 @@ CONF_String(directory_of_inject,
             "crossjoin,/src/exec/pipeline/sort,/src/exec/pipeline/exchange,/src/exec/pipeline/analysis");
 
 // Used by to_base64
-CONF_Int64(max_length_for_to_base64, "200000");
+CONF_mInt64(max_length_for_to_base64, "200000");
 // Used by bitmap functions
-CONF_Int64(max_length_for_bitmap_function, "1000000");
+CONF_mInt64(max_length_for_bitmap_function, "1000000");
 
 // Configuration items for datacache
-CONF_Bool(datacache_enable, "false");
-CONF_String(datacache_mem_size, "10%");
-CONF_String(datacache_disk_size, "0");
-CONF_String(datacache_disk_path, "${STARROCKS_HOME}/datacache/");
-CONF_String(datacache_meta_path, "${STARROCKS_HOME}/datacache/");
+CONF_Bool(datacache_enable, "true");
+CONF_mString(datacache_mem_size, "0");
+CONF_mString(datacache_disk_size, "0");
+CONF_mString(datacache_disk_path, "");
+CONF_String(datacache_meta_path, "");
 CONF_Int64(datacache_block_size, "262144"); // 256K
 CONF_Bool(datacache_checksum_enable, "false");
 CONF_Bool(datacache_direct_io_enable, "false");
@@ -1047,21 +1081,54 @@ CONF_Bool(datacache_direct_io_enable, "false");
 CONF_Int64(datacache_max_concurrent_inserts, "1500000");
 // Total memory limit for in-flight cache jobs.
 // Once this is reached, cache populcation will be rejected until the flying memory usage gets under the limit.
-CONF_Int64(datacache_max_flying_memory_mb, "256");
-// Whether to use datacache adaptor, which will skip reading cache when disk overload is high.
-CONF_Bool(datacache_adaptor_enable, "true");
-// A factor to control the io traffic between cache and network. The larger this parameter,
-// the more requests will be sent to the network.
+// If zero, the datacache module will automatically calculate a resonable default value based on block size.
+CONF_Int64(datacache_max_flying_memory_mb, "2");
+// An io adaptor factor to control the io traffic between cache and network.
+// The larger this parameter, the more requests will be sent to the network.
 // Usually there is no need to modify it.
-CONF_Int64(datacache_skip_read_factor, "1");
+CONF_Double(datacache_skip_read_factor, "1.0");
 // Whether to use block buffer to hold the datacache block data.
 CONF_Bool(datacache_block_buffer_enable, "true");
+// To control how many threads will be created for datacache synchronous tasks.
+// For the default value, it means for every 8 cpu, one thread will be created.
+CONF_Double(datacache_scheduler_threads_per_cpu, "0.125");
+// To control whether cache raw data both in memory and disk.
+// If true, the raw data will be written to the tiered cache composed of memory cache and disk cache,
+// and the memory cache hotter data than disk.
+// If false, the raw data will be written to disk directly and read from disk without promotion.
+// For object data, such as parquet footer object, which can only be cached in memory are not affected
+// by this configuration.
+CONF_Bool(datacache_tiered_cache_enable, "true");
 // DataCache engines, alternatives: cachelib, starcache.
 // Set the default value empty to indicate whether it is manully configured by users.
 // If not, we need to adjust the default engine based on build switches like "WITH_CACHELIB" and "WITH_STARCACHE".
 CONF_String(datacache_engine, "");
 // The interval time (millisecond) for agent report datacache metrics to FE.
 CONF_mInt32(report_datacache_metrics_interval_ms, "60000");
+// Whether enable automatically adjust cache space quota.
+// If true, the cache will choose an appropriate quota based on the current remaining space as the quota.
+// and the quota also will be changed dynamiclly.
+// Once the disk space usage reach the high level, the quota will be decreased to keep the disk usage
+// around the disk safe level.
+// On the other hand, if the cache is full and the disk usage falls below the disk low level for a long time,
+// which is configured by `datacache_disk_idle_seconds_for_expansion`, the cache quota will be increased to keep the
+// disk usage around the disk safe level.
+CONF_mBool(datacache_auto_adjust_enable, "false");
+// The high disk usage level, which trigger the cache eviction and quota decreased.
+CONF_mInt64(datacache_disk_high_level, "80");
+// The safe disk usage level, the cache quota will be decreased to this level once it reach the high level.
+CONF_mInt64(datacache_disk_safe_level, "70");
+// The low disk usage level, which trigger the cache expansion and quota increased.
+CONF_mInt64(datacache_disk_low_level, "60");
+// The interval seconds to check the disk usage and trigger adjustment.
+CONF_mInt64(datacache_disk_adjust_interval_seconds, "10");
+// The silent period, only when the disk usage falls bellow the low level for a time longer than this period,
+// the disk expansion can be triggered
+CONF_mInt64(datacache_disk_idle_seconds_for_expansion, "7200");
+// The minimum total disk quota bytes to adjust, once the quota to adjust is less than this value,
+// cache quota will be reset to zero to avoid overly frequent population and eviction.
+// Default: 100G
+CONF_mInt64(datacache_min_disk_quota_for_adjustment, "107374182400");
 
 // The following configurations will be deprecated, and we use the `datacache` prefix instead.
 // But it is temporarily necessary to keep them for a period of time to be compatible with
@@ -1085,7 +1152,7 @@ CONF_mInt64(l0_max_mem_usage, "104857600"); // 100MB
 // if l0_mem_size exceeds this value, l0 need snapshot
 CONF_mInt64(l0_snapshot_size, "16777216"); // 16MB
 CONF_mInt64(max_tmp_l1_num, "10");
-CONF_mBool(enable_parallel_get_and_bf, "true");
+CONF_mBool(enable_parallel_get_and_bf, "false");
 // Control if using the minor compaction strategy
 CONF_Bool(enable_pindex_minor_compaction, "true");
 // if l2 num is larger than this, stop doing async compaction,
@@ -1114,7 +1181,7 @@ CONF_mInt32(max_bf_read_bytes_percent, "10");
 CONF_mBool(enable_pindex_rebuild_in_compaction, "true");
 
 // enable read pindex by page
-CONF_mBool(enable_pindex_read_by_page, "false");
+CONF_mBool(enable_pindex_read_by_page, "true");
 
 // Used by query cache, cache entries are evicted when it exceeds its capacity(500MB in default)
 CONF_Int64(query_cache_capacity, "536870912");
@@ -1184,6 +1251,11 @@ CONF_mInt64(primary_key_batch_get_index_memory_limit, "104857600"); // 100MB
 // otherwise, StarRocks will use zone map for one column filter
 CONF_mBool(enable_short_key_for_one_column_filter, "false");
 
+CONF_mBool(enable_index_segment_level_zonemap_filter, "true");
+CONF_mBool(enable_index_page_level_zonemap_filter, "true");
+CONF_mBool(enable_index_bloom_filter, "true");
+CONF_mBool(enable_index_bitmap_filter, "true");
+
 CONF_mBool(enable_http_stream_load_limit, "false");
 CONF_mInt32(finish_publish_version_internal, "100");
 
@@ -1198,7 +1270,7 @@ CONF_mBool(enable_drop_tablet_if_unfinished_txn, "true");
 // 0 means no limit
 CONF_Int32(lake_service_max_concurrency, "0");
 
-CONF_mInt64(lake_vacuum_min_batch_delete_size, "1000");
+CONF_mInt64(lake_vacuum_min_batch_delete_size, "100");
 
 // TOPN RuntimeFilter parameters
 CONF_mInt32(desc_hint_split_range, "10");
@@ -1230,15 +1302,44 @@ CONF_mInt32(json_flat_column_max, "20");
 // Disable when pk_dump_interval_seconds <= 0
 CONF_mInt64(pk_dump_interval_seconds, "3600"); // 1 hour
 
+// Min data processed when scaling connector sink writers, default value is the same as Trino
+CONF_mInt64(writer_scaling_min_size_mb, "128");
+
 // whether enable query profile for queries initiated by spark or flink
 CONF_mBool(enable_profile_for_external_plan, "false");
 
 // the max length supported for varchar type
 CONF_mInt32(olap_string_max_length, "1048576");
 
+// Skip get from pk index when light pk compaction publish is enabled
+CONF_mBool(enable_light_pk_compaction_publish, "true");
+
 // jit LRU cache size for total 32 shards, it will be an auto value if it <=0:
 // mem_limit = system memory or process memory limit if set.
 // if mem_limit < 16 GB, disable JIT.
 // else it = min(mem_limit*0.01, 1GB)
 CONF_mInt64(jit_lru_cache_size, "0");
+
+CONF_mInt64(arrow_io_coalesce_read_max_buffer_size, "8388608");
+CONF_mInt64(arrow_io_coalesce_read_max_distance_size, "1048576");
+CONF_mInt64(arrow_read_batch_size, "4096");
+
+// Set to true to enable socket_keepalive option in brpc
+CONF_mBool(brpc_socket_keepalive, "false");
+CONF_mBool(apply_del_vec_after_all_index_filter, "true");
+
+// .crm file can be removed after 1day.
+CONF_mInt32(unused_crm_file_threshold_second, "86400" /** 1day **/);
+
+// python envs config
+// create time worker timeout
+CONF_mInt32(create_child_worker_timeout_ms, "1000");
+// config ENV PYTHONPATH
+CONF_Strings(python_envs, "");
+// report python worker STDERR to client
+CONF_Bool(report_python_worker_error, "true");
+CONF_Bool(python_worker_reuse, "true");
+CONF_Int32(python_worker_expire_time_sec, "300");
+CONF_mBool(enable_pk_strict_memcheck, "true");
+
 } // namespace starrocks::config

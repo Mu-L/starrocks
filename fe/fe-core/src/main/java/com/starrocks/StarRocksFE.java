@@ -54,8 +54,8 @@ import com.starrocks.qe.QeService;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.RunMode;
 import com.starrocks.service.ExecuteEnv;
-import com.starrocks.service.FeServer;
 import com.starrocks.service.FrontendOptions;
+import com.starrocks.service.FrontendThriftServer;
 import com.starrocks.staros.StarMgrServer;
 import org.apache.commons.cli.BasicParser;
 import org.apache.commons.cli.CommandLine;
@@ -115,8 +115,6 @@ public class StarRocksFE {
 
             // set dns cache ttl
             java.security.Security.setProperty("networkaddress.cache.ttl", "60");
-            // Need to put if before `GlobalStateMgr.getCurrentState().waitForReady()`, because it may access aws service
-            setAWSHttpClient();
 
             // check meta dir
             MetaHelper.checkMetaDir();
@@ -161,15 +159,15 @@ public class StarRocksFE {
 
             // init and start:
             // 1. QeService for MySQL Server
-            // 2. FeServer for Thrift Server
+            // 2. FrontendThriftServer for Thrift Server
             // 3. HttpServer for HTTP Server
             QeService qeService = new QeService(Config.query_port, Config.mysql_service_nio_enabled,
                     ExecuteEnv.getInstance().getScheduler());
-            FeServer feServer = new FeServer(Config.rpc_port);
+            FrontendThriftServer frontendThriftServer = new FrontendThriftServer(Config.rpc_port);
             HttpServer httpServer = new HttpServer(Config.http_port);
             httpServer.setup();
 
-            feServer.start();
+            frontendThriftServer.start();
             httpServer.start();
             qeService.start();
 
@@ -235,7 +233,7 @@ public class StarRocksFE {
         try {
             cmd = commandLineParser.parse(options, args);
         } catch (final ParseException e) {
-            LOG.error(e);
+            LOG.error(e.getMessage(), e);
             System.err.println("Failed to parse command line. exit now");
             System.exit(-1);
         }
@@ -313,19 +311,6 @@ public class StarRocksFE {
 
         // helper node is null, means no helper node is specified
         return new CommandLineOptions(false, null);
-    }
-
-    // To resolve: "Multiple HTTP implementations were found on the classpath. To avoid non-deterministic
-    // loading implementations, please explicitly provide an HTTP client via the client builders, set
-    // the software.amazon.awssdk.http.service.impl system property with the FQCN of the HTTP service to
-    // use as the default, or remove all but one HTTP implementation from the classpath"
-    // Currently, there are 2 implements of HTTP client: ApacheHttpClient and UrlConnectionHttpClient
-    // The UrlConnectionHttpClient is introduced by #16602, and it causes the exception.
-    // So we set the default HTTP client to UrlConnectionHttpClient.
-    // TODO: remove this after we remove ApacheHttpClient
-    private static void setAWSHttpClient() {
-        System.setProperty("software.amazon.awssdk.http.service.impl",
-                "software.amazon.awssdk.http.urlconnection.UrlConnectionSdkHttpService");
     }
 
     private static void checkCommandLineOptions(CommandLineOptions cmdLineOpts) {

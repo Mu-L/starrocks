@@ -28,6 +28,10 @@ import configparser
 import datetime
 import json
 import logging
+import trino
+import pyhive
+
+import mysql.connector
 import os
 import re
 import subprocess
@@ -38,8 +42,10 @@ import unittest
 import uuid
 from typing import List, Dict
 
+from fuzzywuzzy import fuzz
 import pymysql as _mysql
 import requests
+from cup import shell
 from nose import tools
 from cup import log
 from requests.auth import HTTPBasicAuth
@@ -47,7 +53,11 @@ from requests.auth import HTTPBasicAuth
 from lib import skip
 from lib import data_delete_lib
 from lib import data_insert_lib
+from lib.github_issue import GitHubApi
 from lib.mysql_lib import MysqlLib
+from lib.trino_lib import TrinoLib
+from lib.spark_lib import SparkLib
+from lib.hive_lib import HiveLib
 
 lib_path = os.path.dirname(os.path.abspath(__file__))
 root_path = os.path.abspath(os.path.join(lib_path, "../"))
@@ -59,6 +69,11 @@ common_result_path = os.path.join(root_path, "common/result")
 LOG_DIR = os.path.join(root_path, "log")
 if not os.path.exists(LOG_DIR):
     os.mkdir(LOG_DIR)
+CRASH_DIR = os.path.join(root_path, "crash_logs")
+if not os.path.exists(CRASH_DIR):
+    os.mkdir(CRASH_DIR)
+
+LOG_LEVEL = logging.INFO
 
 
 class Filter(logging.Filter):
@@ -67,7 +82,7 @@ class Filter(logging.Filter):
     """
 
     # pylint: disable= super-init-not-called
-    def __init__(self, msg_level=logging.WARNING):
+    def __init__(self, msg_level=LOG_LEVEL):
         super().__init__()
         self.msg_level = msg_level
 
@@ -79,7 +94,7 @@ class Filter(logging.Filter):
             except Exception:
                 record.msg = str(record.msg).replace(secret_v, '${%s}' % secret_k)
 
-        if record.levelno >= self.msg_level:
+        if record.levelno < self.msg_level:
             return False
         return True
 
@@ -93,7 +108,7 @@ def self_print(msg):
 
 
 __LOG_FILE = os.path.join(LOG_DIR, "sql_test.log")
-log.init_comlog("sql", log.INFO, __LOG_FILE, log.ROTATION, 100 * 1024 * 1024, False)
+log.init_comlog("sql", LOG_LEVEL, __LOG_FILE, log.ROTATION, 100 * 1024 * 1024, bprint_console=False, gen_wf=False)
 logging.getLogger().addFilter(Filter())
 
 T_R_DB = "t_r_db"
@@ -102,6 +117,9 @@ T_R_TABLE = "t_r_table"
 RESULT_FLAG = "-- result:"
 RESULT_END_FLAT = "-- !result"
 SHELL_FLAG = "shell: "
+TRINO_FLAG = "trino: "
+SPARK_FLAG = "spark: "
+HIVE_FLAG = "hive: "
 FUNCTION_FLAG = "function: "
 NAME_FLAG = "-- name: "
 UNCHECK_FLAG = "[UC]"
@@ -120,15 +138,38 @@ class StarrocksSQLApiLib(object):
         super().__init__(*args, **kwargs)
         self.root_path = root_path
         self.mysql_lib = MysqlLib()
+        self.trino_lib = TrinoLib()
+        self.spark_lib = SparkLib()
+        self.hive_lib = HiveLib()
         self.be_num = 0
         self.mysql_host = ""
         self.mysql_port = ""
         self.mysql_user = ""
         self.mysql_password = ""
+        self.http_port = ""
+        self.host_user = ""
+        self.host_password = ""
+        self.cluster_path = ""
         self.data_insert_lib = data_insert_lib.DataInsertLib()
         self.data_delete_lib = data_delete_lib.DataDeleteLib()
 
+        # trino client config
+        self.trino_host = ""
+        self.trino_port = ""
+        self.trino_user = ""
+
+        # spark client config
+        self.spark_host = ""
+        self.spark_port = ""
+        self.spark_user = ""
+
+        # hive client config
+        self.hive_host = ""
+        self.hive_port = ""
+        self.hive_user = ""
+
         # for t/r record
+        self.case_info = None
         self.log = []
         self.res_log = []
 
@@ -137,6 +178,12 @@ class StarrocksSQLApiLib(object):
             self.read_conf("conf/sr.conf")
         else:
             self.read_conf(config_path)
+
+        if os.environ.get("keep_alive") == "True":
+            self.keep_alive = True
+        else:
+            self.keep_alive = False
+        self.run_info = os.environ.get("run_info", "")
 
     def __del__(self):
         pass
@@ -147,7 +194,191 @@ class StarrocksSQLApiLib(object):
 
     def tearDown(self):
         """tear down"""
-        pass
+        self.keep_cluster_alive()
+
+    def keep_cluster_alive(self):
+        """
+        check crash msg in case logs, and recover alive
+        """
+        if not self.keep_alive:
+            return
+
+        # check if case result contains crash msg: "StarRocks process failed"
+        crash_msg_list = ["StarRocks process failed"]
+        contains_crash_msg = self.check_case_result_contains_crash(crash_msg_list, self.res_log)
+        # wait util be exit
+        if contains_crash_msg:
+            self.wait_until_be_exit()
+
+        # if cluster status is abnormal, get crash log
+        cluster_status_dict = self.get_cluster_status()
+
+        if isinstance(cluster_status_dict, str):
+            if cluster_status_dict == 'abnormal':
+                log.error("FE status is abnormal!")
+
+            return
+
+        if cluster_status_dict["status"] != "abnormal":
+            log.info("Cluster status OK!")
+            return
+
+        # TODO: 判断是不是巡检，不然不需要创建issue
+
+        # analyse be crash info
+        log.warning("Cluster status is abnormal, begin to get crash log...")
+        be_crash_log = self.get_crash_log(cluster_status_dict["ip"][0])
+
+        if be_crash_log != "":
+            crash_similarity = self.get_crash_log_similarity(be_crash_log)
+
+            if crash_similarity >= 90:
+                log.info("Crash log is similarity, skip create issue")
+            else:
+                log.info("Max similarity is %f, create new issue" % crash_similarity)
+                cur_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                with open(f"{CRASH_DIR}/crash_{cur_time}.log", "w") as f:
+                    f.writelines(be_crash_log)
+
+                be_crash_case = self.case_info.name
+
+                title = f"[{self.run_info}] SQL-Tester crash"
+                run_link = os.environ.get('WORKFLOW_URL', '')
+                body = (
+                        """```\nTest Case:\n    %s\n```\n\n ```\nCrash Log: \n%s\n```\n\n```\nSR Version: %s\nBE: %s\nURL: %s\n\n```"""
+                        % (be_crash_case, be_crash_log, cluster_status_dict["version"], cluster_status_dict["ip"][0], run_link)
+                )
+                assignee = os.environ.get("ISSUE_AUTHOR")
+                repo = os.environ.get("GITHUB_REPOSITORY")
+                label = os.environ.get("ISSUE_LABEL")
+                create_issue_res = GitHubApi.create_issue(title, body, label, assignee)
+                log.info(create_issue_res)
+        else:
+            log.warning("Crash log is empty, please check. cluster status is %s" % cluster_status_dict)
+
+        # after create issue, restart crash be
+        start_be_status = "success"
+        for crash_be_ip in cluster_status_dict["ip"]:
+            res = self.start_be(crash_be_ip)
+            if res != 0:
+                start_be_status = "fail"
+                print("BE start failed, please check, ip: %s" % crash_be_ip)
+                break
+        time.sleep(20)
+        cluster_dict = self.get_cluster_status()
+        if len(cluster_dict["ip"]) != 0:
+            log.error("BE start failed, please check, ip: %s" % cluster_dict["ip"])
+
+    def start_be(self, ip):
+        # backup be.out
+        cur_time = datetime.datetime.now().strftime("%H_%M")
+        cmd = "cd %s/be/log/; mv be.out be.out.%s" % (self.cluster_path, cur_time)
+        backup_res = shell.expect.go_ex(ip, self.host_user, self.host_password, cmd, timeout=20, b_print_stdout=True)
+        if backup_res["exitstatus"] != 0 or backup_res["remote_exitstatus"] != 0:
+            log.error("Backup be.out error in host: %s, msg: %s" % (ip, backup_res))
+
+        # be status is not alive and the process exit failed
+        timeout = 300
+        while timeout >= 0:
+            cmd = "ps -ef | grep starrocks_be | grep -v grep"
+            stop_res = shell.expect.go_ex(ip, self.host_user, self.host_password, cmd, timeout=20, b_print_stdout=True)
+            if stop_res["remote_exitstatus"] == 1:
+                break
+
+            time.sleep(5)
+            timeout -= 5
+
+        if timeout < 0:
+            print("BE exit timeout for 300s after crash, ip: %s" % ip)
+            return -1
+
+        time.sleep(10)
+        cmd = (
+            f". ~/.bash_profile; cd {self.cluster_path}/be; ulimit -c unlimited; export ASAN_OPTIONS=abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1;sh bin/start_be.sh --daemon"
+        )
+        start_res = shell.expect.go_ex(ip, self.host_user, self.host_password, cmd, timeout=20, b_print_stdout=True)
+        if start_res["exitstatus"] != 0 or start_res["remote_exitstatus"] != 0:
+            log.error("Start be error, msg: %s" % start_res)
+            return -1
+
+        return 0
+
+    @staticmethod
+    def get_crash_log_similarity(target_crash_log):
+        files_list = os.listdir(CRASH_DIR)
+        crash_log_list = []
+        similarity = 0
+        for crash_file in files_list:
+            with open("%s/%s" % (CRASH_DIR, crash_file), "r") as f:
+                crash_log = "\n".join(f.readlines())
+                crash_log_list.append(crash_log)
+
+        for crash_log in crash_log_list:
+            cur_similarity = fuzz.ratio(crash_log, target_crash_log)
+            similarity = cur_similarity if cur_similarity > similarity else similarity
+
+        return similarity
+
+    def get_crash_log(self, ip):
+        log.warning("Get crash log from %s" % ip)
+        cmd = (
+            f'cd {self.cluster_path}/be/log/; grep -A10000 "*** Check failure stack trace: ***\|ERROR: AddressSanitizer:" be.out'
+        )
+        crash_log = shell.expect.go_ex(ip, self.host_user, self.host_password, cmd, timeout=20, b_print_stdout=False)
+        return crash_log["result"]
+
+    def wait_until_be_exit(self):
+        """
+        wait until be was exited
+        """
+        log.warning("Wait be exit...")
+        timeout = 60
+        while timeout > 0:
+            status_dict = self.get_cluster_status()
+
+            if status_dict == 'abnormal':
+                # fe abnormal
+                return
+
+            elif status_dict["status"] == "abnormal":
+                return
+
+            else:
+                time.sleep(5)
+                timeout -= 1
+
+        return
+
+    def get_cluster_status(self):
+        cmd = f"curl http://root:@{self.mysql_host}:{self.http_port}/api/show_proc?path=/backends"
+        res = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", timeout=30, shell=True
+        )
+        if res.returncode != 0:
+            log.warning("Show backends cmd execute failed, cmd: %s, err_msg: %s" % (cmd, res.stderr))
+            return "abnormal"
+
+        status_dict = {"ip": [], "status": "normal"}
+        for be_info_dict in json.loads(res.stdout):
+            status_dict["version"] = be_info_dict["Version"]
+            if be_info_dict["Alive"] == "false":
+                status_dict["ip"].append(be_info_dict["IP"])
+                status_dict["status"] = "abnormal"
+
+        return status_dict
+
+    @staticmethod
+    def check_case_result_contains_crash(crash_msg_list, case_result_logs):
+        """
+        scan case result logs, return whether contain crash msg
+        """
+        case_result_logs_str = "\n".join(case_result_logs)
+
+        for crash_msg in crash_msg_list:
+            if crash_msg in case_result_logs_str:
+                return True
+
+        return False
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -162,6 +393,24 @@ class StarrocksSQLApiLib(object):
         self.mysql_user = config_parser.get("mysql-client", "user")
         self.mysql_password = config_parser.get("mysql-client", "password")
         self.http_port = config_parser.get("mysql-client", "http_port")
+        self.host_user = config_parser.get("mysql-client", "host_user")
+        self.host_password = config_parser.get("mysql-client", "host_password")
+        self.cluster_path = config_parser.get("mysql-client", "cluster_path")
+
+        # parse trino config
+        self.trino_host = config_parser.get("trino-client", "host")
+        self.trino_port = config_parser.get("trino-client", "port")
+        self.trino_user = config_parser.get("trino-client", "user")
+
+        # parse spark config
+        self.spark_host = config_parser.get("spark-client", "host")
+        self.spark_port = config_parser.get("spark-client", "port")
+        self.spark_user = config_parser.get("spark-client", "user")
+
+        # parse hive config
+        self.hive_host = config_parser.get("hive-client", "host")
+        self.hive_port = config_parser.get("hive-client", "port")
+        self.hive_user = config_parser.get("hive-client", "user")
 
         # read replace info
         for rep_key, rep_value in config_parser.items("replace"):
@@ -187,8 +436,41 @@ class StarrocksSQLApiLib(object):
         }
         self.mysql_lib.connect(mysql_dict)
 
+    def connect_trino(self):
+        trino_dict = {
+            "host": self.trino_host,
+            "port": self.trino_port,
+            "user": self.trino_user,
+        }
+        self.trino_lib.connect(trino_dict)
+
+    def connect_spark(self):
+        spark_dict = {
+            "host": self.spark_host,
+            "port": self.spark_port,
+            "user": self.spark_user,
+        }
+        self.spark_lib.connect(spark_dict)
+
+    def connect_hive(self):
+        hive_dict = {
+            "host": self.hive_host,
+            "port": self.hive_port,
+            "user": self.hive_user,
+        }
+        self.hive_lib.connect(hive_dict)
+
     def close_starrocks(self):
         self.mysql_lib.close()
+
+    def close_trino(self):
+        self.trino_lib.close()
+
+    def close_spark(self):
+        self.spark_lib.close()
+
+    def close_hive(self):
+        self.hive_lib.close()
 
     def create_database(self, database_name, tolerate_exist=False):
         """
@@ -338,6 +620,43 @@ class StarrocksSQLApiLib(object):
             print("unknown error", e)
             raise
 
+    def conn_execute_sql(self, conn, sql):
+        try:
+            cursor = conn.cursor()
+            if sql.endswith(";"):
+                sql = sql[:-1]
+            cursor.execute(sql)
+            result = cursor.fetchall()
+
+            for i in range(len(result)):
+                row = [str(item) for item in result[i]]
+                result[i] = '\t'.join(row)
+
+            return {"status": True, "result": "\n".join(result), "msg": "OK"}
+
+        except trino.exceptions.TrinoQueryError as e:
+            return {"status": False, "msg": e.message}
+        except pyhive.exc.OperationalError as e:
+            return {"status": False, "msg": e.args}
+        except Exception as e:
+            print("unknown error", e)
+            raise
+
+    def trino_execute_sql(self, sql):
+        """trino execute query"""
+        self.connect_trino()
+        return self.conn_execute_sql(self.trino_lib.connector, sql)
+
+    def spark_execute_sql(self, sql):
+        """spark execute query"""
+        self.connect_spark()
+        return self.conn_execute_sql(self.spark_lib.connector, sql)
+
+    def hive_execute_sql(self, sql):
+        """hive execute query"""
+        self.connect_hive()
+        return self.conn_execute_sql(self.hive_lib.connector, sql)
+
     def delete_from(self, args_dict):
         """
         delete from table
@@ -435,7 +754,7 @@ class StarrocksSQLApiLib(object):
         log.info("shell cmd: %s" % shell)
 
         cmd_res = subprocess.run(
-            shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", timeout=1800, shell=True
+            shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", timeout=120, shell=True
         )
 
         log.info("shell result: code: %s, stdout: %s" % (cmd_res.returncode, cmd_res.stdout))
@@ -499,7 +818,7 @@ class StarrocksSQLApiLib(object):
                 try:
                     res = ast.literal_eval(res.replace("null", "None"))
                 except Exception as e:
-                    log.warn("converse array error: %s, %s" % (res, e))
+                    log.warning("converse array error: %s, %s" % (res, e))
 
         return res, res_for_log
 
@@ -563,7 +882,7 @@ class StarrocksSQLApiLib(object):
                     tools.assert_true(re.match(exp_std, act_std, flags=re.S),
                                       "shell result str|re not match,\n[exp]: %s,\n [act]: %s" % (exp_std, act_std))
                 except Exception as e:
-                    log.warn("Try to treat res as regex, failed!\n:%s" % e)
+                    log.warning("Try to treat res as regex, failed!\n:%s" % e)
 
                 tools.assert_true(False, "shell result str|re not match,\n[exp]: %s,\n [act]: %s" % (exp_std, act_std))
 
@@ -598,7 +917,7 @@ class StarrocksSQLApiLib(object):
                         try:
                             expect_res = ast.literal_eval(exp.replace("null", "None"))
                         except Exception as e:
-                            log.warn("converse array error: %s, %s" % (exp, e))
+                            log.warning("converse array error: %s, %s" % (exp, e))
                             expect_res = str(exp)
 
                     tools.assert_equal(type(expect_res), type(act), "exp and act results' type not match")
@@ -629,7 +948,7 @@ class StarrocksSQLApiLib(object):
                     )
                     return
             except Exception as e:
-                log.warn("analyse result before check error, %s" % e)
+                log.warning("analyse result before check error, %s" % e)
 
             # check str
             log.info("[check type]: Str")
@@ -737,13 +1056,13 @@ class StarrocksSQLApiLib(object):
         tools.assert_true(use_res["status"], "use db: [%s] error" % T_R_DB)
 
         self.execute_sql("set group_concat_max_len = 1024000;", True)
-        
+
         # get records
         query_sql = """
-        select file, log_type, name, group_concat(log, ""), group_concat(hex(sequence), ",") 
+        select file, log_type, name, group_concat(log, ""), group_concat(hex(sequence), ",")
         from (
             select * from %s.%s where version=\"%s\" and log_type="R" order by sequence
-        ) a 
+        ) a
         group by file, log_type, name;
         """ % (
             T_R_DB,
@@ -872,6 +1191,7 @@ class StarrocksSQLApiLib(object):
 
     def wait_load_finish(self, label, time_out=300):
         times = 0
+        load_state = ""
         while times < time_out:
             result = self.execute_sql('show load where label = "' + label + '"', True)
             log.info('show load where label = "' + label + '"')
@@ -881,13 +1201,13 @@ class StarrocksSQLApiLib(object):
                 log.info(load_state)
                 if load_state == "CANCELLED":
                     log.info(result)
-                    return False
+                    break
                 elif load_state == "FINISHED":
                     log.info(result)
-                    return True
+                    break
             time.sleep(1)
             times += 1
-        tools.assert_less(times, time_out, "load failed, timeout 300s")
+        tools.assert_true(load_state in ("FINISHED", "CANCELLED"), "wait load finish error, timeout 300s")
 
     def show_routine_load(self, routine_load_task_name):
         show_sql = "show routine load for %s" % routine_load_task_name
@@ -960,25 +1280,115 @@ class StarrocksSQLApiLib(object):
             count += 1
         tools.assert_equal("FINISHED", status, "wait alter table finish error")
 
-    def wait_async_materialized_view_finish(self, mv_name, check_count=60):
+    def wait_materialized_view_cancel(self, check_count=60):
         """
-        wait async materialized view job finish and return status
+        wait materialized view job cancel and return status
         """
         status = ""
-        show_sql = "SHOW MATERIALIZED VIEWS WHERE name='" + mv_name + "'"
+        show_sql = "SHOW ALTER MATERIALIZED VIEW"
         count = 0
-        num = 0
         while count < check_count:
             res = self.execute_sql(show_sql, True)
-            status = res["result"][-1][12]
-            if status != "SUCCESS":
+            status = res["result"][-1][8]
+            if status != "CANCELLED":
                 time.sleep(1)
             else:
                 # sleep another 5s to avoid FE's async action.
                 time.sleep(1)
                 break
             count += 1
-        tools.assert_equal("SUCCESS", status, "wait aysnc materialized view finish error")
+        tools.assert_equal("CANCELLED", status, "wait alter table cancel error")
+
+    def wait_async_materialized_view_finish(self, current_db, mv_name, check_count=None):
+        """
+        wait async materialized view job finish and return status
+        """
+        # show materialized veiws result
+        def is_all_finished1():
+            sql = "SHOW MATERIALIZED VIEWS WHERE database_name='{}' AND NAME='{}'".format(current_db, mv_name)
+            print(sql)
+            result = self.execute_sql(sql, True)
+            if not result["status"]:
+                tools.assert_true(False, "show mv state error")
+            results = result["result"]
+            for res in results:
+                last_refresh_state = res[12]
+                if last_refresh_state != "SUCCESS" and last_refresh_state != "MERGED":
+                    return False
+            return True
+
+        def is_all_finished2():
+            sql = "select STATE from information_schema.task_runs a join information_schema.materialized_views b on a.task_name=b.task_name where b.table_name='{}' and a.`database`='{}'".format(mv_name, current_db)
+            print(sql)
+            result = self.execute_sql(sql, True)
+            if not result["status"]:
+                tools.assert_true(False, "show mv state error")
+            results = result["result"]
+            for res in results:
+                if res[0] != "SUCCESS" and res[0] != "MERGED":
+                    return False
+            return True
+
+        # infomation_schema.task_runs result
+        def get_success_count(results):
+            cnt = 0
+            for res in results:
+                if res[0] == "SUCCESS" or res[0] == "MERGED":
+                    cnt += 1
+            return cnt 
+        
+        MAX_LOOP_COUNT = 30 
+        is_all_ok = False
+        count = 0
+        if check_count is None:
+            while count < MAX_LOOP_COUNT:
+                is_all_ok = is_all_finished1() and is_all_finished2()
+                if is_all_ok:
+                    # sleep another 5s to avoid FE's async action.
+                    time.sleep(2)
+                    break
+                time.sleep(2)
+                count += 1
+        else:
+            show_sql = "select STATE from information_schema.task_runs a join information_schema.materialized_views b on a.task_name=b.task_name where b.table_name='{}' and a.`database`='{}'".format(mv_name, current_db)
+            while count < MAX_LOOP_COUNT:
+                print(show_sql)
+                res = self.execute_sql(show_sql, True)
+                if not res["status"]:
+                    tools.assert_true(False, "show mv state error")
+
+                success_cnt = get_success_count(res["result"])
+                if success_cnt >= check_count:
+                    is_all_ok = True
+                    # sleep to avoid FE's async action.
+                    time.sleep(2)
+                    break
+                time.sleep(2)
+                count += 1
+        tools.assert_equal(True, is_all_ok, "wait aysnc materialized view finish error")
+
+    def wait_mv_refresh_count(self, db_name, mv_name, expect_count):
+        show_sql = """select count(*) from information_schema.materialized_views 
+        join information_schema.task_runs using(task_name)
+        where table_schema='{}' and table_name='{}' and (state = 'SUCCESS' or state = 'MERGED')
+        """.format(db_name, mv_name)
+        print(show_sql)
+        
+        cnt = 1
+        refresh_count = 0
+        while cnt < 60:
+            res = self.execute_sql(show_sql, True)
+            print(res)
+            refresh_count = res["result"][0][0]
+            if refresh_count >= expect_count:
+                return
+            else:
+                print("current refresh count is {}, expect is {}".format(refresh_count, expect_count))
+                time.sleep(1)
+            cnt += 1
+            
+        tools.assert_equal(expect_count, refresh_count, "wait too long for the refresh count")
+
 
     def wait_for_pipe_finish(self, db_name, pipe_name, check_count=60):
         """
@@ -1014,8 +1424,38 @@ class StarrocksSQLApiLib(object):
         time.sleep(1)
         sql = "explain %s" % (query)
         res = self.execute_sql(sql, True)
+        if not res["status"]:
+            print(res)
+        tools.assert_true(res["status"])
+        plan = str(res["result"])
         for expect in expects:
-            tools.assert_true(str(res["result"]).find(expect) > 0, "assert expect %s is not found in plan" % (expect))
+            tools.assert_true(plan.find(expect) > 0, "assert expect %s is not found in plan" % (expect))
+
+    def assert_equal_result(self, *sqls):
+        if len(sqls) < 2:
+            return
+
+        res_list = []
+        # could be faster if making this loop parallel
+        for sql in sqls:
+            if sql.startswith(TRINO_FLAG):
+                sql = sql[len(TRINO_FLAG):]
+                res = self.trino_execute_sql(sql)
+            elif sql.startswith(SPARK_FLAG):
+                sql = sql[len(SPARK_FLAG):]
+                res = self.spark_execute_sql(sql)
+            elif sql.startswith(HIVE_FLAG):
+                sql = sql[len(HIVE_FLAG):]
+                res = self.hive_execute_sql(sql)
+            else:
+                res = self.execute_sql(sql)
+
+            tools.assert_true(res["status"])
+            res_list.append(res["result"])
+
+        # assert equal result
+        for i in range(1, len(res_list)):
+            tools.assert_equal(res_list[0], res_list[i])
 
     def check_no_hit_materialized_view(self, query, *expects):
         """
@@ -1024,6 +1464,9 @@ class StarrocksSQLApiLib(object):
         time.sleep(1)
         sql = "explain %s" % (query)
         res = self.execute_sql(sql, True)
+        if not res["status"]:
+            print(res)
+        tools.assert_true(res["status"])
         for expect in expects:
             tools.assert_false(str(res["result"]).find(expect) > 0, "assert expect %s should not be found" % (expect))
 
@@ -1067,7 +1510,7 @@ class StarrocksSQLApiLib(object):
             if status != "PENDING":
                 break
             time.sleep(0.5)
-    
+
     def wait_optimize_table_finish(self, alter_type="OPTIMIZE", expect_status="FINISHED"):
         """
         wait alter table job finish and return status
@@ -1197,7 +1640,7 @@ class StarrocksSQLApiLib(object):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             encoding="utf-8",
-            timeout=1800,
+            timeout=120,
         )
 
         log.info(cmd_res)
@@ -1384,6 +1827,33 @@ class StarrocksSQLApiLib(object):
 
         tools.assert_true(finished, "analyze timeout")
 
+    def wait_compaction_finish(self, table_name: str, expected_num_segments: int):
+        timeout = 300
+        scan_table_sql = f"SELECT /*+SET_VAR(enable_profile=true,enable_async_profile=false)*/ COUNT(1) FROM {table_name}"
+        fetch_segments_sql = r"""
+            with profile as (
+                select unnest as line from (values(1))t(v) join unnest(split(get_query_profile(last_query_id()), "\n"))
+            )
+            select regexp_extract(line, ".*- SegmentsReadCount: (?:.*\\()?(\\d+)\\)?", 1) as value 
+            from profile 
+            where line like "%- SegmentsReadCount%"
+        """
+
+        while timeout > 0:
+            res = self.execute_sql(scan_table_sql)
+            tools.assert_true(res["status"], f'Fail to execute scan_table_sql, error=[{res["msg"]}]')
+
+            res = self.execute_sql(fetch_segments_sql)
+            tools.assert_true(res["status"], f'Fail to execute fetch_segments_sql, error=[{res["msg"]}]')
+
+            if res["result"] == str(expected_num_segments):
+                break
+
+            time.sleep(1)
+            timeout -= 1
+        else:
+            tools.assert_true(False, "wait compaction timeout")
+
     def _get_backend_http_endpoints(self) -> List[Dict]:
         """Get the http host and port of all the backends.
 
@@ -1436,7 +1906,7 @@ class StarrocksSQLApiLib(object):
                 True,
             )
 
-            status = res["result"][0][6]
+            status = res["result"][0][7]
             if status != ("REFRESHING") and status != ("COMMITTING"):
                 break
             time.sleep(0.5)
@@ -1458,9 +1928,9 @@ class StarrocksSQLApiLib(object):
             "ADMIN SET REPLICA STATUS PROPERTIES('tablet_id' = '%s', 'backend_id' = '%s', 'status' = 'bad')" % (tablet_id, backend_id),
             True,
         )
-        
+
         time.sleep(20)
-        
+
         while True:
             res = self.execute_sql(
                 "SHOW TABLET FROM %s" % table_name,
@@ -1471,3 +1941,89 @@ class StarrocksSQLApiLib(object):
                 time.sleep(0.5)
             else:
                 break
+    def assert_explain_contains(self, query, *expects):
+        """
+        assert explain result contains expect string
+        """
+        sql = "explain %s" % (query)
+        res = self.execute_sql(sql, True)
+        for expect in expects:
+            tools.assert_true(str(res["result"]).find(expect) > 0, "assert expect {} is not found in plan {}".format(expect, res['result']))
+
+    def assert_explain_not_contains(self, query, *expects):
+        """
+        assert explain result contains expect string
+        """
+        sql = "explain %s" % (query)
+        res = self.execute_sql(sql, True)
+        for expect in expects:
+            tools.assert_true(str(res["result"]).find(expect) == -1, "assert expect %s is found in plan" % (expect))
+
+    def assert_explain_costs_contains(self, query, *expects):
+        """
+        assert explain costs result contains expect string
+        """
+        sql = "explain costs %s" % (query)
+        res = self.execute_sql(sql, True)
+        for expect in expects:
+            tools.assert_true(str(res["result"]).find(expect) > 0, "assert expect %s is not found in plan" % (expect))
+
+    def assert_trace_values_contains(self, query, *expects):
+        """
+        assert trace values result contains expect string
+        """
+        sql = "trace values %s" % (query)
+        res = self.execute_sql(sql, True)
+        for expect in expects:
+            tools.assert_true(str(res["result"]).find(expect) > 0, "assert expect %s is not found in plan, error msg is %s" % (expect, str(res["result"])))
+
+    def assert_prepare_execute(self, db, query, params=()):
+        conn = mysql.connector.connect(
+            host=self.mysql_host,
+            user=self.mysql_user,
+            password="",
+            port=self.mysql_port,
+            database=db
+        )
+        cursor = conn.cursor(prepared=True)
+
+        try:
+            if params:
+                cursor.execute(query, ['2'])
+            else:
+                cursor.execute(query)
+            cursor.fetchall()
+        except mysql.connector.Error as e:
+            tools.assert_true(1 == 0, e)
+
+        finally:
+            cursor.close()
+            conn.close()
+
+    def assert_trace_times_contains(self, query, *expects):
+        """
+        assert trace times result contains expect string
+        """
+        sql = "trace times %s" % (query)
+        res = self.execute_sql(sql, True)
+        for expect in expects:
+            tools.assert_true(str(res["result"]).find(expect) > 0, "assert expect %s is not found in plan, error msg is %s" % (expect, str(res["result"])))
+
+    def assert_clear_stale_stats(self, query, expect_num):
+        timeout = 300
+        num = 0;
+        while timeout > 0:
+            res = self.execute_sql(query)
+            num = res["result"]
+            if int(num) < expect_num:
+                break;
+            time.sleep(10)
+            timeout -= 10
+        else:
+            tools.assert_true(False, "clear stale column stats timeout. The number of stale column stats is %s" % num)
+               
+    def assert_table_partitions_num(self, table_name, expect_num):
+        res = self.execute_sql("SHOW PARTITIONS FROM %s" % table_name, True)
+        tools.assert_true(res["status"], "show schema change task error")
+        ans = res["result"]
+        tools.assert_true(len(ans) == expect_num, "The number of partitions is %s" % len(ans))

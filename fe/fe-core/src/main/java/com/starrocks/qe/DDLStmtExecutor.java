@@ -27,6 +27,8 @@ import com.starrocks.common.ErrorReport;
 import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.UserException;
 import com.starrocks.datacache.DataCacheMgr;
+import com.starrocks.datacache.DataCacheSelectExecutor;
+import com.starrocks.datacache.DataCacheSelectMetrics;
 import com.starrocks.load.EtlJobType;
 import com.starrocks.plugin.PluginInfo;
 import com.starrocks.scheduler.Constants;
@@ -66,6 +68,7 @@ import com.starrocks.sql.ast.CancelExportStmt;
 import com.starrocks.sql.ast.CancelLoadStmt;
 import com.starrocks.sql.ast.CancelRefreshDictionaryStmt;
 import com.starrocks.sql.ast.CancelRefreshMaterializedViewStmt;
+import com.starrocks.sql.ast.CleanTemporaryTableStmt;
 import com.starrocks.sql.ast.ClearDataCacheRulesStmt;
 import com.starrocks.sql.ast.CreateAnalyzeJobStmt;
 import com.starrocks.sql.ast.CreateCatalogStmt;
@@ -81,12 +84,14 @@ import com.starrocks.sql.ast.CreateResourceGroupStmt;
 import com.starrocks.sql.ast.CreateResourceStmt;
 import com.starrocks.sql.ast.CreateRoleStmt;
 import com.starrocks.sql.ast.CreateRoutineLoadStmt;
-import com.starrocks.sql.ast.CreateSecurityIntegrationStatement;
 import com.starrocks.sql.ast.CreateStorageVolumeStmt;
 import com.starrocks.sql.ast.CreateTableLikeStmt;
 import com.starrocks.sql.ast.CreateTableStmt;
+import com.starrocks.sql.ast.CreateTemporaryTableLikeStmt;
+import com.starrocks.sql.ast.CreateTemporaryTableStmt;
 import com.starrocks.sql.ast.CreateUserStmt;
 import com.starrocks.sql.ast.CreateViewStmt;
+import com.starrocks.sql.ast.DataCacheSelectStatement;
 import com.starrocks.sql.ast.DropAnalyzeJobStmt;
 import com.starrocks.sql.ast.DropCatalogStmt;
 import com.starrocks.sql.ast.DropDataCacheRuleStmt;
@@ -102,6 +107,7 @@ import com.starrocks.sql.ast.DropRoleStmt;
 import com.starrocks.sql.ast.DropStorageVolumeStmt;
 import com.starrocks.sql.ast.DropTableStmt;
 import com.starrocks.sql.ast.DropTaskStmt;
+import com.starrocks.sql.ast.DropTemporaryTableStmt;
 import com.starrocks.sql.ast.DropUserStmt;
 import com.starrocks.sql.ast.GrantPrivilegeStmt;
 import com.starrocks.sql.ast.GrantRoleStmt;
@@ -147,12 +153,18 @@ import java.util.Map;
 
 public class DDLStmtExecutor {
 
+    private final StmtExecutorVisitor stmtExecutorVisitor;
+
+    public DDLStmtExecutor(StmtExecutorVisitor stmtExecutorVisitor) {
+        this.stmtExecutorVisitor = stmtExecutorVisitor;
+    }
+
     /**
      * Execute various ddl statement
      */
     public static ShowResultSet execute(StatementBase stmt, ConnectContext context) throws Exception {
         try {
-            return stmt.accept(StmtExecutorVisitor.getInstance(), context);
+            return GlobalStateMgr.getCurrentState().getDdlStmtExecutor().stmtExecutorVisitor.visit(stmt, context);
         } catch (RuntimeException re) {
             if (re.getCause() instanceof DdlException) {
                 throw (DdlException) re.getCause();
@@ -166,14 +178,15 @@ public class DDLStmtExecutor {
         }
     }
 
-    static class StmtExecutorVisitor implements AstVisitor<ShowResultSet, ConnectContext> {
-
+    public static class StmtExecutorVisitor implements AstVisitor<ShowResultSet, ConnectContext> {
         private static final Logger LOG = LogManager.getLogger(StmtExecutorVisitor.class);
-
         private static final StmtExecutorVisitor INSTANCE = new StmtExecutorVisitor();
 
         public static StmtExecutorVisitor getInstance() {
             return INSTANCE;
+        }
+
+        protected StmtExecutorVisitor() {
         }
 
         @Override
@@ -225,13 +238,15 @@ public class DDLStmtExecutor {
             ErrorReport.wrapWithRuntimeException(() -> {
                 FunctionName name = stmt.getFunctionName();
                 if (name.isGlobalFunction()) {
-                    context.getGlobalStateMgr().getGlobalFunctionMgr().userAddFunction(stmt.getFunction());
+                    context.getGlobalStateMgr()
+                            .getGlobalFunctionMgr()
+                            .userAddFunction(stmt.getFunction(), stmt.shouldReplaceIfExists());
                 } else {
                     Database db = context.getGlobalStateMgr().getDb(name.getDb());
                     if (db == null) {
                         ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, name.getDb());
                     }
-                    db.addFunction(stmt.getFunction());
+                    db.addFunction(stmt.getFunction(), stmt.shouldReplaceIfExists());
                 }
             });
             return null;
@@ -263,6 +278,14 @@ public class DDLStmtExecutor {
         }
 
         @Override
+        public ShowResultSet visitCreateTemporaryTableStatement(CreateTemporaryTableStmt stmt, ConnectContext context) {
+            ErrorReport.wrapWithRuntimeException(() -> {
+                context.getGlobalStateMgr().getMetadataMgr().createTemporaryTable(stmt);
+            });
+            return null;
+        }
+
+        @Override
         public ShowResultSet visitCreateTableLikeStatement(CreateTableLikeStmt stmt, ConnectContext context) {
             ErrorReport.wrapWithRuntimeException(() -> {
                 context.getGlobalStateMgr().getMetadataMgr().createTableLike(stmt);
@@ -271,9 +294,42 @@ public class DDLStmtExecutor {
         }
 
         @Override
+        public ShowResultSet visitCreateTemporaryTableLikeStatement(
+                CreateTemporaryTableLikeStmt stmt, ConnectContext context) {
+            ErrorReport.wrapWithRuntimeException(() -> {
+                context.getGlobalStateMgr().getMetadataMgr()
+                        .createTemporaryTable((CreateTemporaryTableStmt) stmt.getCreateTableStmt());
+            });
+            return null;
+        }
+
+        @Override
         public ShowResultSet visitDropTableStatement(DropTableStmt stmt, ConnectContext context) {
             ErrorReport.wrapWithRuntimeException(() -> {
-                context.getGlobalStateMgr().getMetadataMgr().dropTable(stmt);
+                if (stmt.getTemporaryTableMark()) {
+                    DropTemporaryTableStmt dropTemporaryTableStmt = new DropTemporaryTableStmt(
+                            stmt.isSetIfExists(), stmt.getTbl(), stmt.isForceDrop());
+                    dropTemporaryTableStmt.setSessionId(context.getSessionId());
+                    context.getGlobalStateMgr().getMetadataMgr().dropTemporaryTable(dropTemporaryTableStmt);
+                } else {
+                    context.getGlobalStateMgr().getMetadataMgr().dropTable(stmt);
+                }
+            });
+            return null;
+        }
+
+        @Override
+        public ShowResultSet visitDropTemporaryTableStatement(DropTemporaryTableStmt stmt, ConnectContext context) {
+            ErrorReport.wrapWithRuntimeException(() -> {
+                context.getGlobalStateMgr().getMetadataMgr().dropTemporaryTable(stmt);
+            });
+            return null;
+        }
+
+        @Override
+        public ShowResultSet visitCleanTemporaryTableStatement(CleanTemporaryTableStmt stmt, ConnectContext context) {
+            ErrorReport.wrapWithRuntimeException(() -> {
+                context.getGlobalStateMgr().getMetadataMgr().cleanTemporaryTables(stmt);
             });
             return null;
         }
@@ -329,10 +385,7 @@ public class DDLStmtExecutor {
         public ShowResultSet visitCancelRefreshMaterializedViewStatement(CancelRefreshMaterializedViewStmt stmt,
                                                                          ConnectContext context) {
             ErrorReport.wrapWithRuntimeException(() -> {
-                context.getGlobalStateMgr().getLocalMetastore()
-                        .cancelRefreshMaterializedView(
-                                stmt.getMvName().getDb(),
-                                stmt.getMvName().getTbl());
+                context.getGlobalStateMgr().getLocalMetastore().cancelRefreshMaterializedView(stmt);
             });
             return null;
         }
@@ -530,17 +583,6 @@ public class DDLStmtExecutor {
         }
 
         @Override
-        public ShowResultSet visitCreateSecurityIntegrationStatement(CreateSecurityIntegrationStatement stmt,
-                                                                     ConnectContext context) {
-            ErrorReport.wrapWithRuntimeException(() -> {
-                context.getGlobalStateMgr().getAuthenticationMgr().createSecurityIntegration(
-                        stmt.getName(), stmt.getPropertyMap());
-            });
-
-            return null;
-        }
-
-        @Override
         public ShowResultSet visitAlterSystemStatement(AlterSystemStmt stmt, ConnectContext context) {
             ErrorReport.wrapWithRuntimeException(() -> {
                 context.getGlobalStateMgr().getAlterJobMgr().processAlterCluster(stmt);
@@ -600,7 +642,7 @@ public class DDLStmtExecutor {
         @Override
         public ShowResultSet visitCreateViewStatement(CreateViewStmt stmt, ConnectContext context) {
             ErrorReport.wrapWithRuntimeException(() -> {
-                GlobalStateMgr.getCurrentState().getLocalMetastore().createView(stmt);
+                GlobalStateMgr.getCurrentState().getMetadataMgr().createView(stmt);
             });
             return null;
         }
@@ -655,7 +697,7 @@ public class DDLStmtExecutor {
         @Override
         public ShowResultSet visitTruncateTableStatement(TruncateTableStmt stmt, ConnectContext context) {
             ErrorReport.wrapWithRuntimeException(() -> {
-                context.getGlobalStateMgr().getLocalMetastore().truncateTable(stmt);
+                context.getGlobalStateMgr().getLocalMetastore().truncateTable(stmt, context);
             });
             return null;
         }
@@ -800,6 +842,7 @@ public class DDLStmtExecutor {
                     analyzeJob = new NativeAnalyzeJob(stmt.getDbId(),
                             stmt.getTableId(),
                             stmt.getColumnNames(),
+                            stmt.getColumnTypes(),
                             stmt.isSample() ? StatsConstants.AnalyzeType.SAMPLE : StatsConstants.AnalyzeType.FULL,
                             StatsConstants.ScheduleType.SCHEDULE,
                             stmt.getProperties(), StatsConstants.ScheduleStatus.PENDING,
@@ -807,6 +850,7 @@ public class DDLStmtExecutor {
                 } else {
                     analyzeJob = new ExternalAnalyzeJob(stmt.getTableName().getCatalog(), stmt.getTableName().getDb(),
                             stmt.getTableName().getTbl(), stmt.getColumnNames(),
+                            stmt.getColumnTypes(),
                             stmt.isSample() ? StatsConstants.AnalyzeType.SAMPLE : StatsConstants.AnalyzeType.FULL,
                             StatsConstants.ScheduleType.SCHEDULE,
                             stmt.getProperties(), StatsConstants.ScheduleStatus.PENDING,
@@ -870,6 +914,15 @@ public class DDLStmtExecutor {
         @Override
         public ShowResultSet visitCreateCatalogStatement(CreateCatalogStmt stmt, ConnectContext context) {
             ErrorReport.wrapWithRuntimeException(() -> {
+                String catalogName = stmt.getCatalogName();
+                if (context.getGlobalStateMgr().getCatalogMgr().catalogExists(catalogName)) {
+                    if (stmt.isIfNotExists()) {
+                        LOG.info("create catalog[{}] which already exists", catalogName);
+                        return;
+                    } else {
+                        ErrorReport.reportDdlException(ErrorCode.ERR_CATALOG_EXISTED_ERROR, catalogName);
+                    }
+                }
                 context.getGlobalStateMgr().getCatalogMgr().createCatalog(stmt);
             });
             return null;
@@ -878,6 +931,15 @@ public class DDLStmtExecutor {
         @Override
         public ShowResultSet visitDropCatalogStatement(DropCatalogStmt stmt, ConnectContext context) {
             ErrorReport.wrapWithRuntimeException(() -> {
+                String catalogName = stmt.getName();
+                if (!context.getGlobalStateMgr().getCatalogMgr().catalogExists(catalogName)) {
+                    if (stmt.isIfExists()) {
+                        LOG.info("drop catalog[{}] which does not exist", catalogName);
+                        return;
+                    } else {
+                        ErrorReport.reportDdlException(ErrorCode.ERR_BAD_CATALOG_ERROR, catalogName);
+                    }
+                }
                 context.getGlobalStateMgr().getCatalogMgr().dropCatalog(stmt);
             });
             return null;
@@ -1017,11 +1079,25 @@ public class DDLStmtExecutor {
             return null;
         }
 
+        @Override
+        public ShowResultSet visitDataCacheSelectStatement(DataCacheSelectStatement statement, ConnectContext context) {
+            DataCacheSelectMetrics metrics = null;
+            try {
+                metrics = DataCacheSelectExecutor.cacheSelect(statement, context);
+            } catch (Exception e) {
+                LOG.warn("Failed to execute cacheSelect", e);
+                throw new RuntimeException(e.getMessage());
+            }
+
+            return metrics.getShowResultSet(statement.isVerbose());
+        }
+
         //=========================================== Dictionary Statement ==================================================
         @Override
         public ShowResultSet visitCreateDictionaryStatement(CreateDictionaryStmt stmt, ConnectContext context) {
             ErrorReport.wrapWithRuntimeException(() -> {
-                context.getGlobalStateMgr().getDictionaryMgr().createDictionary(stmt, context.getDatabase());
+                context.getGlobalStateMgr().getDictionaryMgr().createDictionary(stmt,
+                                                context.getCurrentCatalog(), context.getDatabase());
             });
             return null;
         }

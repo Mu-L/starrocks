@@ -26,6 +26,7 @@ import com.starrocks.privilege.DefaultAuthorizationProvider;
 import com.starrocks.privilege.PrivilegeType;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.analyzer.CreateFunctionAnalyzer;
 import com.starrocks.sql.analyzer.PrivilegeStmtAnalyzer;
 import com.starrocks.sql.ast.CreateFunctionStmt;
 import com.starrocks.sql.ast.CreateUserStmt;
@@ -97,8 +98,8 @@ public class RBACExecutorTest {
         DDLStmtExecutor.execute(grantPrivilegeStmt, ctx);
 
         ShowGrantsStmt stmt = new ShowGrantsStmt(new UserIdentity("u1", "%"));
-        ShowExecutor executor = new ShowExecutor();
-        ShowResultSet resultSet = executor.execute(stmt, ctx);
+
+        ShowResultSet resultSet = ShowExecutor.execute(stmt, ctx);
         Assert.assertEquals("[['u1'@'%', default_catalog, GRANT USAGE, CREATE DATABASE, DROP, ALTER " +
                 "ON CATALOG default_catalog TO USER 'u1'@'%']]", resultSet.getResultRows().toString());
 
@@ -107,8 +108,7 @@ public class RBACExecutorTest {
         DDLStmtExecutor.execute(grantPrivilegeStmt, ctx);
 
         stmt = new ShowGrantsStmt("r1");
-        executor = new ShowExecutor();
-        resultSet = executor.execute(stmt, ctx);
+        resultSet = ShowExecutor.execute(stmt, ctx);
         Assert.assertEquals("[[r1, default_catalog, GRANT USAGE, CREATE DATABASE, DROP, ALTER " +
                 "ON CATALOG default_catalog TO ROLE 'r1']]", resultSet.getResultRows().toString());
 
@@ -125,8 +125,7 @@ public class RBACExecutorTest {
         DDLStmtExecutor.execute(grantPrivilegeStmt, ctx);
 
         stmt = new ShowGrantsStmt("r0");
-        executor = new ShowExecutor();
-        resultSet = executor.execute(stmt, ctx);
+        resultSet = ShowExecutor.execute(stmt, ctx);
         Assert.assertEquals("[[r0, null, GRANT 'r1', 'r2' TO  ROLE r0]," +
                         " [r0, default_catalog, GRANT SELECT ON TABLE db.tbl0 TO ROLE 'r0']]",
                 resultSet.getResultRows().toString());
@@ -140,8 +139,8 @@ public class RBACExecutorTest {
 
         ShowRolesStmt stmt = new ShowRolesStmt();
         ctx.setCurrentUserIdentity(UserIdentity.ROOT);
-        ShowExecutor executor = new ShowExecutor();
-        ShowResultSet resultSet = executor.execute(stmt, ctx);
+
+        ShowResultSet resultSet = ShowExecutor.execute(stmt, ctx);
         String resultString = resultSet.getResultRows().toString();
         // sampling test a some of the result rows
         Assert.assertTrue(
@@ -159,8 +158,8 @@ public class RBACExecutorTest {
     public void testShowUsers() throws Exception {
         ShowUserStmt stmt = new ShowUserStmt(true);
         ctx.setCurrentUserIdentity(UserIdentity.ROOT);
-        ShowExecutor executor = new ShowExecutor();
-        ShowResultSet resultSet = executor.execute(stmt, ctx);
+
+        ShowResultSet resultSet = ShowExecutor.execute(stmt, ctx);
         Assert.assertEquals("[['u3'@'%'], ['root'@'%'], ['u2'@'%'], ['u4'@'%'], ['u1'@'%'], ['u0'@'%']]",
                 resultSet.getResultRows().toString());
     }
@@ -247,15 +246,16 @@ public class RBACExecutorTest {
 
     @Test
     public void testShowFunctionsWithPriv() throws Exception {
-        new MockUp<CreateFunctionStmt>() {
+        new MockUp<PrivilegeStmtAnalyzer>() {
             @Mock
             public void analyze(ConnectContext context) throws AnalysisException {
             }
         };
 
-        new MockUp<PrivilegeStmtAnalyzer>() {
+        new MockUp<CreateFunctionAnalyzer>() {
             @Mock
-            public void analyze(ConnectContext context) throws AnalysisException {
+            public void analyze(CreateFunctionStmt stmt, ConnectContext context) {
+
             }
         };
 
@@ -277,26 +277,23 @@ public class RBACExecutorTest {
         DDLStmtExecutor.execute(statement, ctx);
 
         ShowFunctionsStmt stmt = new ShowFunctionsStmt("db", false, false, false, null, null);
-        ShowExecutor executor = new ShowExecutor();
-        ShowResultSet resultSet = executor.execute(stmt, ctx);
+
+        ShowResultSet resultSet = ShowExecutor.execute(stmt, ctx);
         Assert.assertEquals("[[my_udf_json_get]]", resultSet.getResultRows().toString());
 
         ctx.setCurrentUserIdentity(new UserIdentity("u1", "%"));
         stmt = new ShowFunctionsStmt("db", false, false, false, null, null);
-        executor = new ShowExecutor();
-        resultSet = executor.execute(stmt, ctx);
+        resultSet = ShowExecutor.execute(stmt, ctx);
         Assert.assertEquals("[]", resultSet.getResultRows().toString());
 
         DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(
                 "grant usage on function db.my_udf_json_get(int) to u1", ctx), ctx);
         stmt = new ShowFunctionsStmt("db", false, false, false, null, null);
-        executor = new ShowExecutor();
-        resultSet = executor.execute(stmt, ctx);
+        resultSet = ShowExecutor.execute(stmt, ctx);
         Assert.assertEquals("[[my_udf_json_get]]", resultSet.getResultRows().toString());
 
         stmt = new ShowFunctionsStmt("db", true, false, false, null, null);
-        executor = new ShowExecutor();
-        resultSet = executor.execute(stmt, ctx);
+        resultSet = ShowExecutor.execute(stmt, ctx);
         Assert.assertTrue(resultSet.getResultRows().size() > 0);
     }
 }

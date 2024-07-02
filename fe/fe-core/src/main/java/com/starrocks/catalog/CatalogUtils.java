@@ -23,13 +23,16 @@ import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.InvalidOlapTableStateException;
-import com.starrocks.common.util.concurrent.lock.LockType;
-import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.RunMode;
+import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.ast.AddPartitionClause;
+import com.starrocks.sql.ast.ListPartitionDesc;
 import com.starrocks.sql.ast.MultiItemListPartitionDesc;
 import com.starrocks.sql.ast.PartitionDesc;
+import com.starrocks.sql.ast.RangePartitionDesc;
 import com.starrocks.sql.ast.SingleItemListPartitionDesc;
+import com.starrocks.sql.ast.SingleRangePartitionDesc;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -40,6 +43,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 import static com.starrocks.sql.common.ErrorMsgProxy.PARSER_ERROR_MSG;
@@ -91,25 +95,38 @@ public class CatalogUtils {
         return existPartitionNameSet;
     }
 
+    public static Set<String> getPartitionNamesFromAddPartitionClause(AddPartitionClause addPartitionClause) {
+        Set<String> partitionNames = new TreeSet<>();
+        PartitionDesc partitionDesc = addPartitionClause.getPartitionDesc();
+        if (partitionDesc instanceof SingleItemListPartitionDesc
+                || partitionDesc instanceof MultiItemListPartitionDesc
+                || partitionDesc instanceof SingleRangePartitionDesc) {
+            partitionNames.add(partitionDesc.getPartitionName());
+        } else if (partitionDesc instanceof RangePartitionDesc) {
+            for (PartitionDesc desc : ((RangePartitionDesc) partitionDesc).getSingleRangePartitionDescs()) {
+                partitionNames.add(desc.getPartitionName());
+            }
+        } else if (partitionDesc instanceof ListPartitionDesc) {
+            for (PartitionDesc desc : (((ListPartitionDesc) partitionDesc).getPartitionDescs())) {
+                partitionNames.add(desc.getPartitionName());
+            }
+        }
+        return partitionNames;
+    }
+
     // Used to temporarily disable some command on lake table and remove later.
-    public static void checkIsLakeTable(String dbName, String tableName) throws AnalysisException {
+    public static void checkIsLakeTable(String dbName, String tableName) {
         Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
         if (db == null) {
             return;
         }
 
-        Locker locker = new Locker();
-        locker.lockDatabase(db, LockType.READ);
-        try {
-            Table table = db.getTable(tableName);
-            if (table == null) {
-                return;
-            }
-            if (table.isCloudNativeTable()) {
-                throw new AnalysisException(PARSER_ERROR_MSG.unsupportedOpWithInfo("lake table " + db + "." + tableName));
-            }
-        } finally {
-            locker.unLockDatabase(db, LockType.READ);
+        Table table = db.getTable(tableName);
+        if (table == null) {
+            return;
+        }
+        if (table.isCloudNativeTable()) {
+            throw new SemanticException(PARSER_ERROR_MSG.unsupportedOpWithInfo("lake table " + db + "." + tableName));
         }
     }
 
@@ -180,8 +197,8 @@ public class CatalogUtils {
     }
 
     public static void checkTempPartitionConflict(List<Partition> partitionList,
-                                               List<Partition> tempPartitionList,
-                                               ListPartitionInfo listPartitionInfo) throws DdlException {
+                                                  List<Partition> tempPartitionList,
+                                                  ListPartitionInfo listPartitionInfo) throws DdlException {
         Map<Long, List<LiteralExpr>> listMap = listPartitionInfo.getLiteralExprValues();
         Map<Long, List<List<LiteralExpr>>> multiListMap = listPartitionInfo.getMultiLiteralExprValues();
         Map<Long, List<LiteralExpr>> newListMap = new HashMap<>(listMap);
@@ -254,10 +271,10 @@ public class CatalogUtils {
             throws DdlException {
         try {
             ListPartitionInfo listPartitionInfo = (ListPartitionInfo) olapTable.getPartitionInfo();
-            List<Long> partitionIds = listPartitionInfo.getPartitionIds(isTemp);
+            Set<Long> partitionIds = Sets.newHashSet(listPartitionInfo.getPartitionIds(isTemp));
 
             if (partitionDesc instanceof SingleItemListPartitionDesc) {
-                listPartitionInfo.setBatchLiteralExprValues(listPartitionInfo.getIdToValues());
+                listPartitionInfo.setBatchLiteralExprValues(olapTable.getIdToColumn(), listPartitionInfo.getIdToValues());
                 List<LiteralExpr> allLiteralExprValues = Lists.newArrayList();
                 listPartitionInfo.getLiteralExprValues().forEach((k, v) -> {
                     if (partitionIds.contains(k)) {
@@ -274,38 +291,79 @@ public class CatalogUtils {
                     }
                 }
             } else if (partitionDesc instanceof MultiItemListPartitionDesc) {
-                listPartitionInfo.setBatchMultiLiteralExprValues(listPartitionInfo.getIdToMultiValues());
-                List<List<LiteralExpr>> allMultiLiteralExprValues = Lists.newArrayList();
-                listPartitionInfo.getMultiLiteralExprValues().forEach((k, v) -> {
-                    if (partitionIds.contains(k)) {
-                        allMultiLiteralExprValues.addAll(v);
-                    }
-                });
-
-                int partitionColSize = listPartitionInfo.getPartitionColumns().size();
+                listPartitionInfo.setBatchMultiLiteralExprValues(olapTable.getIdToColumn(),
+                        listPartitionInfo.getIdToMultiValues());
+                int partitionColSize = listPartitionInfo.getPartitionColumnsSize();
                 MultiItemListPartitionDesc multiItemListPartitionDesc = (MultiItemListPartitionDesc) partitionDesc;
-                for (List<LiteralExpr> itemExpr : multiItemListPartitionDesc.getMultiLiteralExprValues()) {
-                    for (List<LiteralExpr> valueExpr : allMultiLiteralExprValues) {
-                        int duplicatedSize = 0;
-                        for (int i = 0; i < itemExpr.size(); i++) {
-                            String itemValue = itemExpr.get(i).getStringValue();
-                            String value = valueExpr.get(i).getStringValue();
-                            if (value.equals(itemValue)) {
-                                duplicatedSize++;
-                            }
-                        }
-                        if (duplicatedSize == partitionColSize) {
-                            List<String> msg = itemExpr.stream()
-                                    .map(value -> ("\"" + value.getStringValue() + "\""))
-                                    .collect(Collectors.toList());
-                            throw new DdlException("Duplicate values " +
-                                    "(" + String.join(",", msg) + ") ");
-                        }
-                    }
-                }
+                checkItemValuesValid(partitionColSize, partitionIds, listPartitionInfo.getMultiLiteralExprValues(),
+                        multiItemListPartitionDesc);
             }
         } catch (AnalysisException e) {
             throw new DdlException(e.getMessage());
+        }
+    }
+
+    private static void checkItemValuesValid(int partitionColSize, Set<Long> partitionIds,
+                                             Map<Long, List<List<LiteralExpr>>> idToMultiLiteralExprValues,
+                                             MultiItemListPartitionDesc multiItemListPartitionDesc)
+            throws AnalysisException, DdlException {
+        List<Map<LiteralExpr, Set<Long>>> valueToIdIndexList = new ArrayList<>();
+        for (int i = 0; i < partitionColSize; ++i) {
+            valueToIdIndexList.add(new HashMap<>());
+        }
+
+        for (Long partitionId : partitionIds) {
+            List<List<LiteralExpr>> multiValues = idToMultiLiteralExprValues.get(partitionId);
+            if (multiValues == null) {
+                // Because of the shadow partition, there may be a situation where multiValues==null
+                continue;
+            }
+
+            for (int columnIdx = 0; columnIdx < partitionColSize; ++columnIdx) {
+                List<LiteralExpr> col = new ArrayList<>();
+                for (List<LiteralExpr> multiValue : multiValues) {
+                    LiteralExpr v = multiValue.get(columnIdx);
+                    col.add(v);
+                }
+
+                Map<LiteralExpr, Set<Long>> v2i = valueToIdIndexList.get(columnIdx);
+                for (LiteralExpr value : col) {
+                    if (v2i.containsKey(value)) {
+                        v2i.get(value).add(partitionId);
+                    } else {
+                        Set<Long> s = new HashSet<>();
+                        s.add(partitionId);
+                        v2i.put(value, s);
+                    }
+                }
+            }
+        }
+
+        for (List<LiteralExpr> values : multiItemListPartitionDesc.getMultiLiteralExprValues()) {
+            boolean isValid = false;
+            Set<Long> pSet = null;
+            for (int i = 0; i < values.size(); ++i) {
+                Map<LiteralExpr, Set<Long>> valueToPartitionIdIndex = valueToIdIndexList.get(i);
+                if (!valueToPartitionIdIndex.containsKey(values.get(i))) {
+                    isValid = true;
+                    break;
+                } else {
+                    if (pSet == null) {
+                        pSet = new HashSet<>(valueToPartitionIdIndex.get(values.get(i)));
+                    } else {
+                        pSet.retainAll(valueToPartitionIdIndex.get(values.get(i)));
+                    }
+                }
+                if (pSet.isEmpty()) {
+                    isValid = true;
+                    break;
+                }
+            }
+            if (!isValid) {
+                List<String> multiValues = values.stream().map(LiteralExpr::getStringValue)
+                        .collect(Collectors.toList());
+                throw new DdlException("Duplicate values " + "(" + String.join(",", multiValues) + ") ");
+            }
         }
     }
 
@@ -366,6 +424,11 @@ public class CatalogUtils {
         int bucketNum = 0;
         if (olapTable.getPartitions().size() < recentPartitionNum || !enableAutoTabletDistribution) {
             bucketNum = CatalogUtils.calBucketNumAccordingToBackends();
+            // If table is not partitioned, the bucketNum should be at least DEFAULT_UNPARTITIONED_TABLE_BUCKET_NUM
+            if (!olapTable.getPartitionInfo().isPartitioned()) {
+                bucketNum = bucketNum > FeConstants.DEFAULT_UNPARTITIONED_TABLE_BUCKET_NUM ?
+                        bucketNum : FeConstants.DEFAULT_UNPARTITIONED_TABLE_BUCKET_NUM;
+            }
             return bucketNum;
         }
 

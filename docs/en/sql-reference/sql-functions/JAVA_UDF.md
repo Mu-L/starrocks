@@ -402,6 +402,7 @@ PROPERTIES (
 | symbol    | The name of the class for the Maven project to which the UDF belongs. The value of this parameter is in the `<package_name>.<class_name>` format. |
 | type      | The type of the UDF. Set the value to `StarrocksJar`, which specifies that the UDF is a Java-based function. |
 | file      | The HTTP URL from which you can download the JAR file that contains the code for the UDF. The value of this parameter is in the `http://<http_server_ip>:<http_server_port>/<jar_package_name>` format. |
+| isolation | (Optional) To share function instances across UDF executions and support static variables, set this to "shared". |
 
 #### Create a UDAF
 
@@ -547,10 +548,12 @@ For more information, see [DROP FUNCTION](../sql-statements/data-definition/DROP
 
 ## Parameter settings
 
-Configure the following environment variable in the **be/conf/hadoop_env.sh** file of each Java virtual machine (JVM) in your StarRocks cluster to control memory usage. You can also configure other parameters in the file.
+Configure the following environment variable in the **be/conf/be.conf** file of each Java virtual machine (JVM) in your StarRocks cluster to control memory usage. If you use JDK 8, configure `JAVA_OPTS`. If you use JDK 9 or later, configure `JAVA_OPTS_FOR_JDK_9_AND_LATER`.
 
 ```Bash
-export LIBHDFS_OPTS="-Xloggc:$STARROCKS_HOME/log/be.gc.log -server"
+JAVA_OPTS="-Xmx12G"
+
+JAVA_OPTS_FOR_JDK_9_AND_LATER="-Xmx12G"
 ```
 
 ## FAQ

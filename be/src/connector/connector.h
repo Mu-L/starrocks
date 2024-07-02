@@ -15,10 +15,11 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
-#include "connector_sink/connector_chunk_sink.h"
+#include "connector_chunk_sink.h"
 #include "exec/pipeline/scan/morsel.h"
 #include "exprs/runtime_filter_bank.h"
 #include "gen_cpp/InternalService_types.h"
@@ -84,6 +85,11 @@ public:
         int mem_alloc_failed_count;
     };
     void update_profile(const Profile& profile);
+    void set_morsel(pipeline::ScanMorsel* morsel) { _morsel = morsel; }
+
+    void set_driver_sequence(size_t driver_sequence) {
+        runtime_bloom_filter_eval_context.driver_sequence = driver_sequence;
+    }
 
 protected:
     int64_t _read_limit = -1; // no limit
@@ -95,7 +101,12 @@ protected:
     TupleDescriptor* _tuple_desc = nullptr;
     pipeline::ScanSplitContext* _split_context = nullptr;
 
-    virtual void _init_chunk(ChunkPtr* chunk, size_t n) { *chunk = ChunkHelper::new_chunk(*_tuple_desc, n); }
+    virtual Status _init_chunk_if_needed(ChunkPtr* chunk, size_t n) {
+        *chunk = ChunkHelper::new_chunk(*_tuple_desc, n);
+        return Status::OK();
+    }
+
+    pipeline::ScanMorsel* _morsel = nullptr;
 };
 
 class StreamDataSource : public DataSource {
@@ -157,8 +168,22 @@ public:
         *max_value = MAX_DATA_SOURCE_MEM_BYTES;
     }
 
+    virtual StatusOr<pipeline::MorselQueuePtr> convert_scan_range_to_morsel_queue(
+            const std::vector<TScanRangeParams>& scan_ranges, int node_id, int32_t pipeline_dop,
+            bool enable_tablet_internal_parallel, TTabletInternalParallelMode::type tablet_internal_parallel_mode,
+            size_t num_total_scan_ranges, size_t scan_dop = 0);
+
+    int64_t get_scan_dop() const { return scan_dop; }
+
+    // possible physical distribution optimize of data source
+    virtual bool sorted_by_keys_per_tablet() const { return false; }
+    virtual bool output_chunk_by_bucket() const { return false; }
+    virtual bool is_asc_hint() const { return true; }
+    virtual std::optional<bool> partition_order_hint() const { return std::nullopt; }
+
 protected:
     std::vector<ExprContext*> _partition_exprs;
+    int64_t scan_dop = 0;
 };
 using DataSourceProviderPtr = std::unique_ptr<DataSourceProvider>;
 

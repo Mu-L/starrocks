@@ -19,25 +19,63 @@
 #include <arrow/io/api.h>
 #include <arrow/io/file.h>
 #include <arrow/io/interfaces.h>
+#include <arrow/result.h>
 #include <gen_cpp/DataSinks_types.h>
 #include <parquet/api/reader.h>
 #include <parquet/api/writer.h>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
 #include <parquet/exception.h>
+#include <parquet/platform.h>
+#include <parquet/schema.h>
+#include <parquet/types.h>
+#include <stddef.h>
+#include <stdint.h>
 
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "column/chunk.h"
 #include "column/nullable_column.h"
+#include "column/vectorized_fwd.h"
+#include "common/status.h"
+#include "common/statusor.h"
+#include "exprs/function_context.h"
 #include "formats/column_evaluator.h"
 #include "formats/file_writer.h"
 #include "formats/parquet/chunk_writer.h"
 #include "formats/parquet/file_writer.h"
 #include "formats/utils.h"
 #include "fs/fs.h"
+#include "gen_cpp/Types_types.h"
 #include "runtime/runtime_state.h"
+#include "runtime/types.h"
 #include "util/priority_thread_pool.hpp"
+
+namespace parquet {
+class FileMetaData;
+class ParquetFileWriter;
+class WriterProperties;
+} // namespace parquet
+namespace starrocks {
+class Chunk;
+class FileSystem;
+class PriorityThreadPool;
+class RuntimeState;
+
+namespace parquet {
+class ChunkWriter;
+class ParquetOutputStream;
+} // namespace parquet
+} // namespace starrocks
 
 namespace starrocks::formats {
 
@@ -52,6 +90,12 @@ struct ParquetWriterOptions : FileWriterOptions {
     int64_t write_batch_size = 4096;
     int64_t rowgroup_size = 128L * 1024 * 1024; // 128MB
     std::optional<std::vector<FileColumnId>> column_ids = std::nullopt;
+    std::string time_zone = TimezoneUtils::default_time_zone;
+    bool use_legacy_decimal_encoding = false;
+    bool use_int96_timestamp_encoding = false;
+
+    inline static std::string USE_LEGACY_DECIMAL_ENCODING = "use_legacy_decimal_encoding";
+    inline static std::string USE_INT96_TIMESTAMP_ENCODING = "use_int96_timestamp_encoding";
 };
 
 class ParquetFileWriter final : public FileWriter {
@@ -61,7 +105,7 @@ public:
                       std::vector<std::unique_ptr<ColumnEvaluator>>&& column_evaluators,
                       TCompressionType::type compression_type,
                       const std::shared_ptr<ParquetWriterOptions>& writer_options,
-                      const std::function<void()> rollback_action, PriorityThreadPool* executors,
+                      const std::function<void()>& rollback_action, PriorityThreadPool* executors,
                       RuntimeState* runtime_state);
 
     ~ParquetFileWriter() override;
@@ -77,14 +121,14 @@ public:
 private:
     static StatusOr<::parquet::Compression::type> _convert_compression_type(TCompressionType::type type);
 
-    static arrow::Result<std::shared_ptr<::parquet::schema::GroupNode>> _make_schema(
+    arrow::Result<std::shared_ptr<::parquet::schema::GroupNode>> _make_schema(
             const std::vector<std::string>& file_column_names, const std::vector<TypeDescriptor>& type_descs,
             const std::vector<FileColumnId>& file_column_ids);
 
-    static arrow::Result<::parquet::schema::NodePtr> _make_schema_node(const std::string& name,
-                                                                       const TypeDescriptor& type_desc,
-                                                                       ::parquet::Repetition::type rep_type,
-                                                                       FileColumnId file_column_id);
+    arrow::Result<::parquet::schema::NodePtr> _make_schema_node(const std::string& name,
+                                                                const TypeDescriptor& type_desc,
+                                                                ::parquet::Repetition::type rep_type,
+                                                                FileColumnId file_column_id);
 
     static FileStatistics _statistics(const ::parquet::FileMetaData* meta_data, bool has_field_id);
 
@@ -107,6 +151,14 @@ private:
     const std::function<void()> _rollback_action;
     PriorityThreadPool* _executors = nullptr;
     RuntimeState* _runtime_state = nullptr;
+
+    struct ExecutionState {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool has_unfinished_task = false;
+    };
+
+    std::shared_ptr<ExecutionState> _execution_state = std::make_shared<ExecutionState>();
 };
 
 class ParquetFileWriterFactory : public FileWriterFactory {
@@ -120,7 +172,7 @@ public:
 
     Status init() override;
 
-    StatusOr<std::shared_ptr<FileWriter>> create(const std::string& path) override;
+    StatusOr<std::shared_ptr<FileWriter>> create(const std::string& path) const override;
 
 private:
     std::shared_ptr<FileSystem> _fs;

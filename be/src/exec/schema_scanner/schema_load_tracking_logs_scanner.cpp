@@ -26,11 +26,11 @@ namespace starrocks {
 
 SchemaScanner::ColumnDesc SchemaLoadTrackingLogsScanner::_s_tbls_columns[] = {
         //   name,       type,          size,     is_null
-        {"JOB_ID", TYPE_BIGINT, sizeof(int64_t), false},
-        {"LABEL", TYPE_VARCHAR, sizeof(StringValue), false},
-        {"DATABASE_NAME", TYPE_VARCHAR, sizeof(StringValue), false},
-        {"TRACKING_LOG", TYPE_VARCHAR, sizeof(StringValue), true},
-        {"TYPE", TYPE_VARCHAR, sizeof(StringValue), true}};
+        {"JOB_ID", TypeDescriptor::from_logical_type(TYPE_BIGINT), sizeof(int64_t), false},
+        {"LABEL", TypeDescriptor::create_varchar_type(sizeof(StringValue)), sizeof(StringValue), false},
+        {"DATABASE_NAME", TypeDescriptor::create_varchar_type(sizeof(StringValue)), sizeof(StringValue), false},
+        {"TRACKING_LOG", TypeDescriptor::create_varchar_type(sizeof(StringValue)), sizeof(StringValue), true},
+        {"TYPE", TypeDescriptor::create_varchar_type(sizeof(StringValue)), sizeof(StringValue), true}};
 
 SchemaLoadTrackingLogsScanner::SchemaLoadTrackingLogsScanner()
         : SchemaScanner(_s_tbls_columns, sizeof(_s_tbls_columns) / sizeof(SchemaScanner::ColumnDesc)),
@@ -54,12 +54,8 @@ Status SchemaLoadTrackingLogsScanner::start(RuntimeState* state) {
         load_params.__set_load_type(*(_param->type));
     }
 
-    int32_t timeout = static_cast<int32_t>(std::min(state->query_options().query_timeout * 1000 / 2, INT_MAX));
-    if (nullptr != _param->ip && 0 != _param->port) {
-        RETURN_IF_ERROR(SchemaHelper::get_tracking_loads(*(_param->ip), _param->port, load_params, &_result, timeout));
-    } else {
-        return Status::InternalError("IP or port doesn't exists");
-    }
+    RETURN_IF_ERROR(SchemaScanner::init_schema_scanner_state(state));
+    RETURN_IF_ERROR(SchemaHelper::get_tracking_loads(_ss_state, load_params, &_result));
     _start_ts = UnixSeconds();
     _state = state;
 
@@ -100,7 +96,7 @@ Status SchemaLoadTrackingLogsScanner::fill_chunk(ChunkPtr* chunk) {
             case 4: {
                 // tracking message
                 if (info.__isset.urls) {
-                    for (auto url : info.urls) {
+                    for (const auto& url : info.urls) {
                         _fill_tracking_msg(url);
                     }
                     std::stringstream ss;

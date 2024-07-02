@@ -16,6 +16,7 @@
 
 #include "exec/hdfs_scanner.h"
 #include "exec/iceberg/iceberg_delete_builder.h"
+#include "exec/paimon/paimon_delete_file_builder.h"
 #include "formats/parquet/file_reader.h"
 #include "runtime/descriptors.h"
 #include "util/runtime_profile.h"
@@ -37,11 +38,21 @@ Status HdfsParquetScanner::do_init(RuntimeState* runtime_state, const HdfsScanne
                     runtime_state, _mor_processor));
         }
         _app_stats.iceberg_delete_files_per_scan += scanner_params.deletes.size();
+    } else if (scanner_params.paimon_deletion_file != nullptr) {
+        std::unique_ptr<PaimonDeleteFileBuilder> paimon_delete_file_builder(
+                new PaimonDeleteFileBuilder(scanner_params.fs, &_need_skip_rowids));
+        RETURN_IF_ERROR(paimon_delete_file_builder->build(scanner_params.paimon_deletion_file.get()));
     }
     return Status::OK();
 }
 
 void HdfsParquetScanner::do_update_counter(HdfsScanProfile* profile) {
+    // if we have split tasks, we don't need to update counter
+    // and we will update those counters in sub io tasks.
+    if (has_split_tasks()) {
+        return;
+    }
+
     RuntimeProfile::Counter* request_bytes_read = nullptr;
     RuntimeProfile::Counter* request_bytes_read_uncompressed = nullptr;
     RuntimeProfile::Counter* level_decode_timer = nullptr;
@@ -52,6 +63,7 @@ void HdfsParquetScanner::do_update_counter(HdfsScanProfile* profile) {
     RuntimeProfile::Counter* footer_read_timer = nullptr;
     RuntimeProfile::Counter* footer_cache_write_counter = nullptr;
     RuntimeProfile::Counter* footer_cache_write_bytes = nullptr;
+    RuntimeProfile::Counter* footer_cache_write_fail_counter = nullptr;
     RuntimeProfile::Counter* footer_cache_read_counter = nullptr;
     RuntimeProfile::Counter* footer_cache_read_timer = nullptr;
     RuntimeProfile::Counter* column_reader_init_timer = nullptr;
@@ -85,6 +97,8 @@ void HdfsParquetScanner::do_update_counter(HdfsScanProfile* profile) {
             ADD_CHILD_COUNTER(root, "FooterCacheWriteCount", TUnit::UNIT, kParquetProfileSectionPrefix);
     footer_cache_write_bytes =
             ADD_CHILD_COUNTER(root, "FooterCacheWriteBytes", TUnit::BYTES, kParquetProfileSectionPrefix);
+    footer_cache_write_fail_counter =
+            ADD_CHILD_COUNTER(root, "FooterCacheWriteFailCount", TUnit::UNIT, kParquetProfileSectionPrefix);
     footer_cache_read_counter =
             ADD_CHILD_COUNTER(root, "FooterCacheReadCount", TUnit::UNIT, kParquetProfileSectionPrefix);
     footer_cache_read_timer = ADD_CHILD_TIMER(root, "FooterCacheReadTimer", kParquetProfileSectionPrefix);
@@ -121,6 +135,7 @@ void HdfsParquetScanner::do_update_counter(HdfsScanProfile* profile) {
     COUNTER_UPDATE(footer_read_timer, _app_stats.footer_read_ns);
     COUNTER_UPDATE(footer_cache_write_counter, _app_stats.footer_cache_write_count);
     COUNTER_UPDATE(footer_cache_write_bytes, _app_stats.footer_cache_write_bytes);
+    COUNTER_UPDATE(footer_cache_write_fail_counter, _app_stats.footer_cache_write_fail_count);
     COUNTER_UPDATE(footer_cache_read_counter, _app_stats.footer_cache_read_count);
     COUNTER_UPDATE(footer_cache_read_timer, _app_stats.footer_cache_read_ns);
     COUNTER_UPDATE(column_reader_init_timer, _app_stats.column_reader_init_ns);

@@ -13,7 +13,6 @@
 // limitations under the License.
 package com.starrocks.common.lock;
 
-import com.starrocks.common.Config;
 import com.starrocks.common.util.concurrent.lock.LockManager;
 import com.starrocks.common.util.concurrent.lock.LockTimeoutException;
 import com.starrocks.common.util.concurrent.lock.LockType;
@@ -29,7 +28,6 @@ public class TestLockException {
     @Before
     public void setUp() {
         GlobalStateMgr.getCurrentState().setLockManager(new LockManager());
-        Config.lock_manager_dead_lock_detection_delay_time_ms = 0;
     }
 
     /**

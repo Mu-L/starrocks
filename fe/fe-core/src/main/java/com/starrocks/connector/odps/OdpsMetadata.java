@@ -219,7 +219,7 @@ public class OdpsMetadata implements ConnectorMetadata {
     }
 
     @Override
-    public List<String> listPartitionNames(String databaseName, String tableName) {
+    public List<String> listPartitionNames(String databaseName, String tableName, long snapshotId) {
         OdpsTableName odpsTableName = OdpsTableName.of(databaseName, tableName);
         // TODO: perhaps not good to support users to fetch whole tables?
         List<Partition> partitions = get(partitionCache, odpsTableName);
@@ -361,7 +361,7 @@ public class OdpsMetadata implements ConnectorMetadata {
                     throw new StarRocksConnectorException(
                             "unsupported split policy: " + properties.get(OdpsProperties.SPLIT_POLICY));
             }
-            RemoteFileDesc odpsRemoteFileDesc = RemoteFileDesc.createOdpsRemoteFileDesc(odpsSplitsInfo);
+            OdpsRemoteFileDesc odpsRemoteFileDesc = OdpsRemoteFileDesc.createOdpsRemoteFileDesc(odpsSplitsInfo);
             List<RemoteFileDesc> remoteFileDescs = ImmutableList.of(odpsRemoteFileDesc);
             remoteFileInfo.setFiles(remoteFileDescs);
             return Lists.newArrayList(remoteFileInfo);

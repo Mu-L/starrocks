@@ -17,7 +17,9 @@
 
 package com.starrocks.planner;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
 import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.analysis.SlotDescriptor;
@@ -36,6 +38,7 @@ import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PartitionInfo;
 import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.PartitionType;
+import com.starrocks.catalog.ColumnId;
 import com.starrocks.catalog.PhysicalPartitionImpl;
 import com.starrocks.catalog.RandomDistributionInfo;
 import com.starrocks.catalog.RangePartitionInfo;
@@ -47,8 +50,11 @@ import com.starrocks.catalog.Type;
 import com.starrocks.common.Status;
 import com.starrocks.common.UserException;
 import com.starrocks.common.jmockit.Deencapsulation;
+import com.starrocks.lake.LakeTablet;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.ast.PartitionValue;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TDataSink;
 import com.starrocks.thrift.TExplainLevel;
@@ -61,18 +67,24 @@ import com.starrocks.thrift.TTabletLocation;
 import com.starrocks.thrift.TTabletType;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.thrift.TWriteQuorumType;
+import com.starrocks.warehouse.DefaultWarehouse;
+import com.starrocks.warehouse.Warehouse;
 import mockit.Expectations;
 import mockit.Injectable;
+import mockit.Mock;
+import mockit.MockUp;
 import mockit.Mocked;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class OlapTableSinkTest {
     private static final Logger LOG = LogManager.getLogger(OlapTableSinkTest.class);
@@ -102,6 +114,32 @@ public class OlapTableSinkTest {
         v2.setIsMaterialized(true);
 
         return tuple;
+    }
+
+    @Before
+    public void before() {
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Warehouse getWarehouse(long warehouseId) {
+                return new DefaultWarehouse(WarehouseManager.DEFAULT_WAREHOUSE_ID,
+                        WarehouseManager.DEFAULT_WAREHOUSE_NAME);
+            }
+
+            @Mock
+            public ComputeNode getComputeNode(LakeTablet tablet) {
+                return new ComputeNode(1L, "127.0.0.1", 9030);
+            }
+
+            @Mock
+            public ComputeNode getComputeNode(Long warehouseId, LakeTablet tablet) {
+                return new ComputeNode(1L, "127.0.0.1", 9030);
+            }
+
+            @Mock
+            public ImmutableMap<Long, ComputeNode> getComputeNodesFromWarehouse(long warehouseId) {
+                return ImmutableMap.of(1L, new ComputeNode(1L, "127.0.0.1", 9030));
+            }
+        };
     }
 
     @Test
@@ -158,7 +196,7 @@ public class OlapTableSinkTest {
                 result = partInfo;
                 partInfo.getType();
                 result = PartitionType.RANGE;
-                partInfo.getPartitionColumns();
+                partInfo.getPartitionColumns((Map<ColumnId, Column>) any);
                 result = Lists.newArrayList(partKey);
                 dstTable.getPartitions();
                 result = Lists.newArrayList(p1, p2);
@@ -391,6 +429,9 @@ public class OlapTableSinkTest {
                 3, Lists.newArrayList(new Column("id", Type.BIGINT)));
         Partition partition = new Partition(1, "p1", index, distInfo);
 
+        Map<ColumnId, Column> idToColumn = Maps.newTreeMap(ColumnId.CASE_INSENSITIVE_ORDER);
+        idToColumn.put(ColumnId.create("province"), new Column("province", Type.STRING));
+
         new Expectations() {
             {
                 dstTable.getId();
@@ -401,6 +442,8 @@ public class OlapTableSinkTest {
                 result = partition;
                 dstTable.getPartitionInfo();
                 result = listPartitionInfo;
+                dstTable.getIdToColumn();
+                result = idToColumn;
             }
         };
 

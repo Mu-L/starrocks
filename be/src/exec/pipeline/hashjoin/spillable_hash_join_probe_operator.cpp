@@ -56,6 +56,10 @@ void SpillableHashJoinProbeOperator::close(RuntimeState* state) {
 }
 
 bool SpillableHashJoinProbeOperator::has_output() const {
+    if (!is_ready()) {
+        DCHECK(false) << "is_ready() must be true before call has_output";
+        return false;
+    }
     if (!spilled()) {
         return HashJoinProbeOperator::has_output();
     }
@@ -117,6 +121,10 @@ bool SpillableHashJoinProbeOperator::has_output() const {
 }
 
 bool SpillableHashJoinProbeOperator::need_input() const {
+    if (!is_ready()) {
+        DCHECK(false) << "is_ready() must be true before call has_output";
+        return false;
+    }
     if (!spilled()) {
         return HashJoinProbeOperator::need_input();
     }
@@ -525,6 +533,8 @@ Status SpillableHashJoinProbeOperatorFactory::prepare(RuntimeState* state) {
     _spill_options->plan_node_id = _plan_node_id;
     _spill_options->encode_level = state->spill_encode_level();
     _spill_options->wg = state->fragment_ctx()->workgroup();
+    _spill_options->enable_buffer_read = state->enable_spill_buffer_read();
+    _spill_options->max_read_buffer_bytes = state->max_spill_read_buffer_bytes_per_driver();
 
     return Status::OK();
 }

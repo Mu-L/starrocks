@@ -31,13 +31,9 @@ public class MvRewriteStrategy {
     // Whether enable force rewrite for query plans with join operator by rule based mv rewrite
     public boolean enableForceRBORewrite = false;
 
-    // rbo config
-    public boolean enableRBOViewBasedRewrite = false;
-    public boolean enableRBOSingleTableRewrite = false;
-
-    // cbo config
-    public boolean enableCBORewrite = false;
-    public boolean enableCBOSingleTableRewrite = false;
+    public boolean enableViewBasedRewrite = false;
+    public boolean enableSingleTableRewrite = false;
+    public boolean enableMultiTableRewrite = false;
 
     static class MvStrategyArbitrator {
         private final OptimizerConfig optimizerConfig;
@@ -98,14 +94,6 @@ public class MvRewriteStrategy {
             return true;
         }
 
-        private boolean isEnableCBOSingleTableRewrite() {
-            if (sessionVariable.isEnableMaterializedViewViewDeltaRewrite() &&
-                    optimizerContext.getCandidateMvs().stream().anyMatch(MaterializationContext::hasMultiTables)) {
-                return true;
-            }
-            return false;
-        }
-
         private boolean isEnableCBOMultiTableRewrite(OptExpression queryPlan) {
             if (!sessionVariable.isEnableMaterializedViewSingleTableViewDeltaRewrite() &&
                     MvUtils.getAllTables(queryPlan).size() <= 1) {
@@ -137,11 +125,21 @@ public class MvRewriteStrategy {
         strategy.enableForceRBORewrite = sessionVariable.isEnableForceRuleBasedMvRewrite();
 
         // rbo strategies
-        strategy.enableRBOViewBasedRewrite = arbitrator.isEnableRBOViewBasedRewrite();
-        strategy.enableRBOSingleTableRewrite = arbitrator.isEnableRBOSingleTableRewrite(queryPlan);
+        strategy.enableViewBasedRewrite = arbitrator.isEnableRBOViewBasedRewrite();
+        strategy.enableSingleTableRewrite = arbitrator.isEnableRBOSingleTableRewrite(queryPlan);
 
         // cbo strategies
-        strategy.enableCBORewrite = arbitrator.isEnableCBOMultiTableRewrite(queryPlan);
-        strategy.enableCBOSingleTableRewrite = arbitrator.isEnableCBOSingleTableRewrite();
+        strategy.enableMultiTableRewrite = arbitrator.isEnableCBOMultiTableRewrite(queryPlan);
+    }
+
+    @Override
+    public String toString() {
+        return "MvRewriteStrategy{" +
+                "enableMaterializedViewRewrite=" + enableMaterializedViewRewrite +
+                ", enableForceRBORewrite=" + enableForceRBORewrite +
+                ", enableViewBasedRewrite=" + enableViewBasedRewrite +
+                ", enableSingleTableRewrite=" + enableSingleTableRewrite +
+                ", enableMultiTableRewrite=" + enableMultiTableRewrite +
+                '}';
     }
 }

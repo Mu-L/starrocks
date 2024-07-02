@@ -15,25 +15,24 @@
 #include "exec/tablet_sink_index_channel.h"
 
 #include "column/chunk.h"
-#include "column/column_helper.h"
 #include "column/column_viewer.h"
 #include "column/nullable_column.h"
 #include "common/statusor.h"
+#include "common/utils.h"
 #include "config.h"
 #include "exec/tablet_sink.h"
 #include "exprs/expr_context.h"
 #include "gutil/strings/fastmem.h"
 #include "gutil/strings/join.h"
-#include "gutil/strings/substitute.h"
 #include "runtime/current_thread.h"
-#include "runtime/exec_env.h"
 #include "runtime/runtime_state.h"
 #include "serde/protobuf_serde.h"
 #include "util/brpc_stub_cache.h"
 #include "util/compression/compression_utils.h"
 #include "util/thrift_rpc_helper.h"
+#include "util/thrift_util.h"
 
-namespace starrocks::stream_load {
+namespace starrocks {
 
 class OlapTableSink; // forward declaration
 NodeChannel::NodeChannel(OlapTableSink* parent, int64_t node_id, bool is_incremental, ExprContext* where_clause)
@@ -102,6 +101,7 @@ Status NodeChannel::init(RuntimeState* state) {
         request->set_sender_id(_parent->_sender_id);
         request->set_eos(false);
         request->set_timeout_ms(_rpc_timeout_ms);
+        request->set_sink_id(_parent->_sink_id);
     }
     _rpc_request.set_allocated_id(&_parent->_load_id);
 
@@ -169,6 +169,11 @@ void NodeChannel::_open(int64_t index_id, RefCountClosure<PTabletWriterOpenResul
     request.set_txn_trace_parent(_parent->_txn_trace_parent);
     request.set_allocated_schema(_parent->_schema->to_protobuf());
     request.set_is_lake_tablet(_parent->_is_lake_table);
+    if (_parent->_is_lake_table) {
+        // If the OlapTableSink node is responsible for writing the txn log, then the tablet writer
+        // does not need to write the txn log again.
+        request.mutable_lake_tablet_params()->set_write_txn_log(!_parent->_write_txn_log);
+    }
     request.set_is_replicated_storage(_parent->_enable_replicated_storage);
     request.set_node_id(_node_id);
     request.set_write_quorum(_write_quorum_type);
@@ -177,6 +182,7 @@ void NodeChannel::_open(int64_t index_id, RefCountClosure<PTabletWriterOpenResul
     request.set_is_incremental(incremental_open);
     request.set_sender_id(_parent->_sender_id);
     request.set_immutable_tablet_size(_parent->_automatic_bucket_size);
+    request.set_sink_id(_parent->_sink_id);
     for (auto& tablet : tablets) {
         auto ptablet = request.add_tablets();
         ptablet->CopyFrom(tablet);
@@ -192,6 +198,7 @@ void NodeChannel::_open(int64_t index_id, RefCountClosure<PTabletWriterOpenResul
     // we need use is_vectorized to make other BE open vectorized delta writer
     request.set_is_vectorized(true);
     request.set_timeout_ms(_rpc_timeout_ms);
+    request.mutable_load_channel_profile_config()->CopyFrom(_parent->_load_channel_profile_config);
 
     // set global dict
     const auto& global_dict = _runtime_state->get_load_global_dict_map();
@@ -214,7 +221,7 @@ void NodeChannel::_open(int64_t index_id, RefCountClosure<PTabletWriterOpenResul
     // This ref is for RPC's reference
     open_closure->ref();
     open_closure->cntl.set_timeout_ms(_rpc_timeout_ms);
-    open_closure->cntl.ignore_eovercrowded();
+    SET_IGNORE_OVERCROWDED(open_closure->cntl, load);
 
     if (request.ByteSizeLong() > _parent->_rpc_http_min_size) {
         TNetworkAddress brpc_addr;
@@ -540,6 +547,16 @@ Status NodeChannel::_filter_indexes_with_where_expr(Chunk* input, const std::vec
     return Status::OK();
 }
 
+template <typename T>
+void serialize_to_iobuf(const T& proto_obj, butil::IOBuf* iobuf) {
+    butil::IOBuf tmp_iobuf;
+    butil::IOBufAsZeroCopyOutputStream wrapper(&tmp_iobuf);
+    proto_obj.SerializeToZeroCopyStream(&wrapper);
+    size_t request_size = tmp_iobuf.size();
+    iobuf->append(&request_size, sizeof(request_size));
+    iobuf->append(tmp_iobuf);
+}
+
 Status NodeChannel::_send_request(bool eos, bool finished) {
     if (eos || finished) {
         if (_request_queue.empty()) {
@@ -607,7 +624,8 @@ Status NodeChannel::_send_request(bool eos, bool finished) {
     _add_batch_closures[_current_request_index]->ref();
     _add_batch_closures[_current_request_index]->reset();
     _add_batch_closures[_current_request_index]->cntl.set_timeout_ms(_rpc_timeout_ms);
-    _add_batch_closures[_current_request_index]->cntl.ignore_eovercrowded();
+    SET_IGNORE_OVERCROWDED(_add_batch_closures[_current_request_index]->cntl, load);
+
     _add_batch_closures[_current_request_index]->request_size = request.ByteSizeLong();
 
     _mem_tracker->consume(_add_batch_closures[_current_request_index]->request_size);
@@ -623,9 +641,9 @@ Status NodeChannel::_send_request(bool eos, bool finished) {
             if (!res.ok()) {
                 return res.status();
             }
-            res.value()->tablet_writer_add_chunks(&_add_batch_closures[_current_request_index]->cntl, &request,
-                                                  &_add_batch_closures[_current_request_index]->result,
-                                                  _add_batch_closures[_current_request_index]);
+            auto closure = _add_batch_closures[_current_request_index];
+            serialize_to_iobuf<PTabletWriterAddChunksRequest>(request, &closure->cntl.request_attachment());
+            res.value()->tablet_writer_add_chunks_via_http(&closure->cntl, nullptr, &closure->result, closure);
             VLOG(2) << "NodeChannel::_send_request() issue a http rpc, request size = " << request.ByteSizeLong();
         } else {
             _stub->tablet_writer_add_chunks(&_add_batch_closures[_current_request_index]->cntl, &request,
@@ -643,9 +661,9 @@ Status NodeChannel::_send_request(bool eos, bool finished) {
             if (!res.ok()) {
                 return res.status();
             }
-            res.value()->tablet_writer_add_chunk(
-                    &_add_batch_closures[_current_request_index]->cntl, request.mutable_requests(0),
-                    &_add_batch_closures[_current_request_index]->result, _add_batch_closures[_current_request_index]);
+            auto closure = _add_batch_closures[_current_request_index];
+            serialize_to_iobuf<PTabletWriterAddChunkRequest>(request.requests(0), &closure->cntl.request_attachment());
+            res.value()->tablet_writer_add_chunk_via_http(&closure->cntl, nullptr, &closure->result, closure);
             VLOG(2) << "NodeChannel::_send_request() issue a http rpc, request size = " << request.ByteSizeLong();
         } else {
             _stub->tablet_writer_add_chunk(
@@ -750,12 +768,28 @@ Status NodeChannel::_wait_request(ReusableClosure<PTabletWriterAddBatchResult>* 
             tablet_ids.emplace_back(commit_info.tabletId);
         }
     }
+    for (auto& log : *(closure->result.mutable_lake_tablet_data()->mutable_txn_logs())) {
+        _txn_logs.emplace_back(std::move(log));
+    }
 
     if (!tablet_ids.empty()) {
         string commit_tablet_id_list_str;
         JoinInts(tablet_ids, ",", &commit_tablet_id_list_str);
         LOG(INFO) << "OlapTableSink txn_id: " << _parent->_txn_id << " load_id: " << print_id(_parent->_load_id)
                   << " commit " << _tablet_commit_infos.size() << " tablets: " << commit_tablet_id_list_str;
+    }
+
+    if (closure->result.has_load_channel_profile()) {
+        const auto* buf = (const uint8_t*)(closure->result.load_channel_profile().data());
+        uint32_t len = closure->result.load_channel_profile().size();
+        TRuntimeProfileTree thrift_profile;
+        auto profile_st = deserialize_thrift_msg(buf, &len, TProtocolType::BINARY, &thrift_profile);
+        if (!profile_st.ok()) {
+            LOG(ERROR) << "Failed to deserialize LoadChannel profile, NodeChannel[" << _load_info << "] from ["
+                       << _node_info->host << ":" << _node_info->brpc_port << "], status: " << profile_st;
+        } else {
+            _runtime_state->load_channel_profile()->update(thrift_profile);
+        }
     }
 
     return Status::OK();
@@ -938,12 +972,13 @@ void NodeChannel::_cancel(int64_t index_id, const Status& err_st) {
     request.set_index_id(index_id);
     request.set_sender_id(_parent->_sender_id);
     request.set_txn_id(_parent->_txn_id);
+    request.set_sink_id(_parent->_sink_id);
 
     auto closure = new RefCountClosure<PTabletWriterCancelResult>();
 
     closure->ref();
     closure->cntl.set_timeout_ms(_rpc_timeout_ms);
-    closure->cntl.ignore_eovercrowded();
+    SET_IGNORE_OVERCROWDED(closure->cntl, load);
     _stub->tablet_writer_cancel(&closure->cntl, &request, &closure->result, closure);
     request.release_id();
 }
@@ -1015,4 +1050,4 @@ bool IndexChannel::has_intolerable_failure() {
     }
 }
 
-} // namespace starrocks::stream_load
+} // namespace starrocks

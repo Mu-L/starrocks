@@ -24,6 +24,7 @@ import com.starrocks.catalog.HiveTable;
 import com.starrocks.catalog.HudiTable;
 import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.Table;
+import com.starrocks.connector.hudi.HudiRemoteFileDesc;
 import com.starrocks.datacache.DataCacheExprRewriter;
 import com.starrocks.datacache.DataCacheMgr;
 import com.starrocks.datacache.DataCacheOptions;
@@ -63,6 +64,7 @@ public class RemoteScanRangeLocations {
     private final List<TScanRangeLocations> result = new ArrayList<>();
     private final List<DescriptorTable.ReferencedPartitionInfo> partitionInfos = new ArrayList<>();
     private boolean forceScheduleLocal = false;
+    private boolean canBackendSplitFile = false;
 
     public void setup(DescriptorTable descTbl, Table table, HDFSScanNodePredicates scanNodePredicates) {
         Collection<Long> selectedPartitionIds = scanNodePredicates.getSelectedPartitionIds();
@@ -107,7 +109,7 @@ public class RemoteScanRangeLocations {
         if (fileDesc.isSplittable()) {
             // if splittable, then use max split size.
             splitSize = sv.getConnectorMaxSplitSize();
-            if (sv.isEnableConnectorSplitIoTasks() && partition.getFormat().isBackendSplittable()) {
+            if (canBackendSplitFile && sv.isEnableConnectorSplitIoTasks() && partition.getFormat().isBackendSplittable()) {
                 // if BE can split, use a higher threshold.
                 splitSize = sv.getConnectorHugeFileSize();
             }
@@ -196,7 +198,7 @@ public class RemoteScanRangeLocations {
 
     private void createHudiScanRangeLocations(long partitionId,
                                               RemoteFileInfo partition,
-                                              RemoteFileDesc fileDesc,
+                                              HudiRemoteFileDesc fileDesc,
                                               boolean useJNIReader, DataCacheOptions dataCacheOptions) {
         TScanRangeLocations scanRangeLocations = new TScanRangeLocations();
 
@@ -281,6 +283,37 @@ public class RemoteScanRangeLocations {
         return Optional.of(dataCacheOptions);
     }
 
+    private void updateCanBackendSplitFile(List<RemoteFileInfo> partitions) {
+        canBackendSplitFile = true;
+        ConnectContext connectContext = ConnectContext.get();
+        if (connectContext == null) {
+            return;
+        }
+        // if we let backend do split file work, how many splits we will get.
+        int splits = getSplitsIfBackendSplitFile(partitions, connectContext);
+        // if splits is small comparing to nodes, then better not let backend do split.
+        int nodes = connectContext.getAliveComputeNumber() + connectContext.getAliveBackendNumber();
+        if ((nodes * 2) >= splits) {
+            canBackendSplitFile = false;
+        }
+    }
+
+    private static int getSplitsIfBackendSplitFile(List<RemoteFileInfo> partitions, ConnectContext connectContext) {
+        SessionVariable sv = connectContext.getSessionVariable();
+        int splits = 0;
+        long splitSize = sv.getConnectorHugeFileSize();
+        for (int i = 0; i < partitions.size(); i++) {
+            for (RemoteFileDesc fileDesc : partitions.get(i).getFiles()) {
+                if (fileDesc.isSplittable()) {
+                    splits += (fileDesc.getLength() + splitSize - 1) / splitSize;
+                } else {
+                    splits += 1;
+                }
+            }
+        }
+        return splits;
+    }
+
     public List<TScanRangeLocations> getScanRangeLocations(DescriptorTable descTbl, Table table,
                                                            HDFSScanNodePredicates scanNodePredicates) {
         result.clear();
@@ -306,6 +339,8 @@ public class RemoteScanRangeLocations {
             LOG.error("Failed to get remote files", e);
             throw e;
         }
+
+        updateCanBackendSplitFile(partitions);
 
         if (table instanceof HiveTable) {
             for (int i = 0; i < partitions.size(); i++) {
@@ -351,7 +386,8 @@ public class RemoteScanRangeLocations {
                 }
                 descTbl.addReferencedPartitions(table, partitionInfos.get(i));
                 for (RemoteFileDesc fileDesc : partitions.get(i).getFiles()) {
-                    if (fileDesc.getLength() == -1 && fileDesc.getHudiDeltaLogs().isEmpty()) {
+                    HudiRemoteFileDesc hudiFiledesc = (HudiRemoteFileDesc) fileDesc;
+                    if (fileDesc.getLength() == -1 && hudiFiledesc.getHudiDeltaLogs().isEmpty()) {
                         String message = "Error: get a empty hudi fileSlice";
                         throw new StarRocksPlannerException(message, ErrorType.INTERNAL_ERROR);
                     }
@@ -360,8 +396,8 @@ public class RemoteScanRangeLocations {
                         continue;
                     }
                     boolean useJNIReader =
-                            forceJNIReader || (morTable && snapshot && !fileDesc.getHudiDeltaLogs().isEmpty());
-                    createHudiScanRangeLocations(partitionInfos.get(i).getId(), partitions.get(i), fileDesc,
+                            forceJNIReader || (morTable && snapshot && !hudiFiledesc.getHudiDeltaLogs().isEmpty());
+                    createHudiScanRangeLocations(partitionInfos.get(i).getId(), partitions.get(i), hudiFiledesc,
                             useJNIReader, dataCacheOptions);
                 }
             }

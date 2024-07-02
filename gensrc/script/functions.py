@@ -328,7 +328,7 @@ vectorized_functions = [
     [30316, 'str_to_map', True, False, 'MAP_VARCHAR_VARCHAR', ['ARRAY_VARCHAR', 'VARCHAR'],
      'StringFunctions::str_to_map_v1'],
     [30317, 'str_to_map', True, False, 'MAP_VARCHAR_VARCHAR', ['VARCHAR', 'VARCHAR', 'VARCHAR'],
-     'StringFunctions::str_to_map'],
+     'StringFunctions::str_to_map', 'StringFunctions::str_to_map_prepare', 'StringFunctions::str_to_map_close'],
 
     [30320, 'regexp_extract', True, False, 'VARCHAR', ['VARCHAR', 'VARCHAR', 'BIGINT'],
      'StringFunctions::regexp_extract',
@@ -708,6 +708,8 @@ vectorized_functions = [
     # hash function
     [100010, 'murmur_hash3_32', True, False, 'INT', ['VARCHAR', '...'], 'HashFunctions::murmur_hash3_32'],
     [100021, 'xx_hash3_64', True, False, 'BIGINT', ['VARCHAR', '...'], 'HashFunctions::xx_hash3_64'],
+    [100022, 'xx_hash3_128', True, False, 'LARGEINT', ['VARCHAR', '...'], 'HashFunctions::xx_hash3_128'],
+
 
     # Utility functions
     [100011, 'sleep', True, False, 'BOOLEAN', ['INT'], "UtilityFunctions::sleep"],
@@ -722,6 +724,13 @@ vectorized_functions = [
     [100020, 'get_query_profile', True, False, 'VARCHAR', ['VARCHAR'], "UtilityFunctions::get_query_profile"],
 
     # json string function
+    [110022, "get_json_int", False, False, "BIGINT", ["VARCHAR", "VARCHAR"], "JsonFunctions::get_json_bigint",
+    "JsonFunctions::native_json_path_prepare", "JsonFunctions::native_json_path_close", False],
+    [110023, "get_json_int", False, False, "BIGINT", ["JSON", "VARCHAR"], "JsonFunctions::get_native_json_bigint",
+     "JsonFunctions::native_json_path_prepare", "JsonFunctions::native_json_path_close", False],
+
+    # deprecated INT version, use BIGINT version
+    # FE find function by signature order
     [110000, "get_json_int", False, False, "INT", ["VARCHAR", "VARCHAR"], "JsonFunctions::get_json_int",
      "JsonFunctions::native_json_path_prepare", "JsonFunctions::native_json_path_close"],
     [110001, "get_json_double", False, False, "DOUBLE", ["VARCHAR", "VARCHAR"], "JsonFunctions::get_json_double",
@@ -738,6 +747,9 @@ vectorized_functions = [
      "JsonFunctions::native_json_path_prepare", "JsonFunctions::native_json_path_close"],
     [110020, "get_json_object", False, True, "VARCHAR", ["VARCHAR", "VARCHAR"], "JsonFunctions::get_json_string",
      "JsonFunctions::native_json_path_prepare", "JsonFunctions::native_json_path_close"],
+    [110021, "get_json_bool", False, False, "BOOLEAN", ["JSON", "VARCHAR"], "JsonFunctions::get_native_json_bool",
+     "JsonFunctions::native_json_path_prepare", "JsonFunctions::native_json_path_close"],
+
 
     # json type function
     [110003, "parse_json", False, False, "JSON", ["VARCHAR"], "JsonFunctions::parse_json"],
@@ -1197,6 +1209,8 @@ vectorized_functions = [
      "ArrayFunctions::array_generate<TYPE_BIGINT>"],
     [150334, 'array_generate', True, False, 'ARRAY_LARGEINT', ['LARGEINT', 'LARGEINT', 'LARGEINT'],
      "ArrayFunctions::array_generate<TYPE_LARGEINT>"],
+
+    [150335, 'array_sortby', True, False, 'ANY_ARRAY', ['ANY_ARRAY', 'ANY_ARRAY', 'ANY_ARRAY', "..."], 'ArrayFunctions::array_sortby_multi'],
 
     # high-order functions related to lambda functions.
     [160100, 'array_map', True, False, 'ANY_ARRAY', ['FUNCTION', 'ANY_ARRAY', "..."], 'ArrayFunctions::array_map'],

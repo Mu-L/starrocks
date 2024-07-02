@@ -290,18 +290,23 @@ public class CreateMaterializedViewStmt extends DdlStmt {
             context.getSessionVariable().setSqlSelectLimit(originSelectLimit);
         }
 
+        boolean hasTemporaryTable = AnalyzerUtils.hasTemporaryTables(queryStatement);
+        if (hasTemporaryTable) {
+            throw new SemanticException(("Materialized view can't base on temporary table"));
+        }
+
         // forbid explain query
         if (queryStatement.isExplain()) {
             throw new IllegalArgumentException("Creating materialized view does not support explain query");
         }
 
         if (!(queryStatement.getQueryRelation() instanceof SelectRelation)) {
-            throw new SemanticException("Materialized view query statement only support select");
+            throw new SemanticException("Materialized view query statement only supports a single query blocks");
         }
 
         Map<TableName, Table> tables = AnalyzerUtils.collectAllTableAndViewWithAlias(queryStatement);
         if (tables.size() != 1) {
-            throw new UnsupportedMVException("The materialized view only support one table in from clause.");
+            throw new UnsupportedMVException("The materialized view only supports one table in from clause.");
         }
         Map.Entry<TableName, Table> entry = tables.entrySet().iterator().next();
         Table table = entry.getValue();
@@ -640,6 +645,7 @@ public class CreateMaterializedViewStmt extends DdlStmt {
             if (mvColumnItem.getAggregationType() != null) {
                 break;
             }
+            // NOTE: Change aggregate type of the column to none rather than null
             mvColumnItem.setAggregationType(AggregateType.NONE, true);
         }
     }
@@ -709,6 +715,7 @@ public class CreateMaterializedViewStmt extends DdlStmt {
             // supply value
             for (; theBeginIndexOfValue < mvColumnItemList.size(); theBeginIndexOfValue++) {
                 MVColumnItem mvColumnItem = mvColumnItemList.get(theBeginIndexOfValue);
+                // NOTE: Change aggregate type of the column to none rather than null
                 mvColumnItem.setAggregationType(AggregateType.NONE, true);
             }
         }

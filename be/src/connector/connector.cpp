@@ -83,7 +83,8 @@ Status DataSource::parse_runtime_filters(RuntimeState* state) {
     if (_runtime_filters == nullptr || _runtime_filters->size() == 0) return Status::OK();
     for (const auto& item : _runtime_filters->descriptors()) {
         RuntimeFilterProbeDescriptor* probe = item.second;
-        const JoinRuntimeFilter* filter = probe->runtime_filter();
+        DCHECK(runtime_bloom_filter_eval_context.driver_sequence != -1);
+        const JoinRuntimeFilter* filter = probe->runtime_filter(runtime_bloom_filter_eval_context.driver_sequence);
         if (filter == nullptr) continue;
         SlotId slot_id;
         if (!probe->is_probe_slot_ref(&slot_id)) continue;
@@ -104,6 +105,49 @@ Status DataSource::parse_runtime_filters(RuntimeState* state) {
 void DataSource::update_profile(const Profile& profile) {
     RuntimeProfile::Counter* mem_alloc_failed_counter = ADD_COUNTER(_runtime_profile, "MemAllocFailed", TUnit::UNIT);
     mem_alloc_failed_counter->update(profile.mem_alloc_failed_count);
+}
+
+StatusOr<pipeline::MorselQueuePtr> DataSourceProvider::convert_scan_range_to_morsel_queue(
+        const std::vector<TScanRangeParams>& scan_ranges, int node_id, int32_t pipeline_dop,
+        bool enable_tablet_internal_parallel, TTabletInternalParallelMode::type tablet_internal_parallel_mode,
+        size_t num_total_scan_ranges, size_t scan_dop) {
+    peek_scan_ranges(scan_ranges);
+
+    pipeline::Morsels morsels;
+    // If this scan node does not accept non-empty scan ranges, create a placeholder one.
+    if (!accept_empty_scan_ranges() && scan_ranges.empty()) {
+        morsels.emplace_back(std::make_unique<pipeline::ScanMorsel>(node_id, TScanRangeParams()));
+    } else {
+        for (const auto& scan_range : scan_ranges) {
+            morsels.emplace_back(std::make_unique<pipeline::ScanMorsel>(node_id, scan_range));
+        }
+    }
+
+    if (partition_order_hint().has_value()) {
+        bool asc = partition_order_hint().value();
+        std::stable_sort(morsels.begin(), morsels.end(), [asc](auto& l, auto& r) {
+            auto l_partition_id = down_cast<pipeline::ScanMorsel*>(l.get())->partition_id();
+            auto r_partition_id = down_cast<pipeline::ScanMorsel*>(r.get())->partition_id();
+            if (asc) {
+                return std::less()(l_partition_id, r_partition_id);
+            } else {
+                return std::greater()(l_partition_id, r_partition_id);
+            }
+        });
+    }
+
+    if (output_chunk_by_bucket()) {
+        std::stable_sort(morsels.begin(), morsels.end(), [](auto& l, auto& r) {
+            return down_cast<pipeline::ScanMorsel*>(l.get())->owner_id() <
+                   down_cast<pipeline::ScanMorsel*>(r.get())->owner_id();
+        });
+    }
+
+    auto morsel_queue = std::make_unique<pipeline::DynamicMorselQueue>(std::move(morsels));
+    if (scan_dop > 0) {
+        morsel_queue->set_max_degree_of_parallelism(scan_dop);
+    }
+    return morsel_queue;
 }
 
 } // namespace starrocks::connector

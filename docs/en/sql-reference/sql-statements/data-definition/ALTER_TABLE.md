@@ -32,8 +32,8 @@ alter_clause1[, alter_clause2, ...]
 
 `alter_clause` can held the following operations: rename, comment, partition, bucket, column, rollup index, bitmap index, table property, swap, and compaction.
 
-- rename: renames a table, rollup index, or partition. **Note that column names cannot be modified.**
-- comment: modifies the table comment (supported from **v3.1 onwards**). Currently, column comments cannot be modified.
+- rename: renames a table, rollup index, or partition.
+- comment: modifies the table comment (supported from **v3.1 onwards**).
 - partition: modifies partition properties, drops a partition, or adds a partition.
 - bucket: modifies the bucketing method and number of buckets.
 - column: adds, drops, or reorders columns, or modifies column type.
@@ -42,13 +42,14 @@ alter_clause1[, alter_clause2, ...]
 - swap: atomic exchange of two tables.
 - compaction: performs manual compaction to merge versions of loaded data (supported from **v3.1 onwards**).
 
-:::note
+## Limits and usage notes
 
-- Operations on partition, column and rollup index cannot be performed in one ALTER TABLE statement.
+- Operations on partition, column, and rollup index cannot be performed in one ALTER TABLE statement.
+- Column names cannot be modified.
+- Column comments cannot be modified.
+- One table can have only one ongoing schema change operation at a time. You cannot run two schema change commands on a table at the same time.
 - Operations on bucket, column and rollup index are asynchronous operations. A success message is return immediately after the task is submitted. You can run the [SHOW ALTER TABLE](../data-manipulation/SHOW_ALTER.md) command to check the progress, and run the [CANCEL ALTER TABLE](../data-definition/CANCEL_ALTER_TABLE.md) command to cancel the operation.
 - Operations on rename, comment, partition, bitmap index and swap are synchronous operations, and a command return indicates that the execution is finished.
-
-:::
 
 ### Rename
 
@@ -90,28 +91,97 @@ Currently, column comments cannot be modified.
 
 #### Add a partition
 
-Syntax:
+You can choose to add range partitions or list partitions.
 
-```SQL
-ALTER TABLE [<db_name>.]<tbl_name> 
-ADD PARTITION [IF NOT EXISTS] <partition_name>
-partition_desc ["key"="value"]
-[DISTRIBUTED BY HASH (k1[,k2 ...]) [BUCKETS num]];
-```
+Syntax：
 
-Note:
+- Range partitions
 
-1. Partition_desc supports the following two expressions:
+    ```SQL
+    ALTER TABLE
+        ADD { single_range_partition | multi_range_partitions } [distribution_desc] ["key"="value"];
 
-    ```plain
-    VALUES LESS THAN [MAXVALUE|("value1", ...)]
-    VALUES ("value1", ...), ("value1", ...)
+    single_range_partition ::=
+        PARTITION [IF NOT EXISTS] <partition_name> VALUES partition_key_desc
+
+    partition_key_desc ::=
+        { LESS THAN { MAXVALUE | value_list }
+        | [ value_list , value_list ) } -- Note that [ represents a left-closed interval.
+
+    value_list ::=
+        ( <value> [, ...] )
+
+    multi_range_partitions ::=
+        { PARTITIONS START ("<start_date_value>") END ("<end_date_value>") EVERY ( INTERVAL <N> <time_unit> )
+        | PARTITIONS START ("<start_integer_value>") END ("<end_integer_value>") EVERY ( <granularity> ) } -- The partition column values still need to be enclosed in double quotes even if the partition column values specified by START and END are integers. However, the interval values in the EVERY clause do not need to be enclosed in double quotes.
     ```
 
-2. partition is the left-closed-right-open interval. If the user only specifies the right boundary, the system will automatically determine the left boundary.
-3. If the bucket mode is not specified, the bucket method used by the built-in table is automatically used.
-4. If the bucket mode is specified, only the bucket number can be modified, and the bucket mode or bucket column cannot be modified.
-5. The user can set some properties of the partition in `["key"="value"]`. See [CREATE TABLE](CREATE_TABLE.md) for details.
+- List partitions
+
+    ```SQL
+    ALTER TABLE
+        ADD PARTITION <partition_name> VALUES IN (value_list) [distribution_desc] ["key"="value"];
+
+    value_list ::=
+        value_item [, ...]
+
+    value_item ::=
+        { <value> | ( <value> [, ...] ) }
+    ```
+
+Parameters:
+
+- Partition-related parameters:
+
+  - For range partitions, you can add a single range partition (`single_range_partition`) or multiple range partitions in batch (`multi_range_partitions`).
+  - For list partitions, you can only add a single list partition.
+
+- `distribution_desc`:
+
+   You can set the number of buckets for the new partition separately, but you cannot set the bucketing method separately.
+
+- `"key"="value"`:
+
+   You can set properties for the new partition. For details, see [CREATE TABLE](./CREATE_TABLE.md#properties).
+
+Examples:
+
+- Range partitions
+
+  - If the partition column is specified as `event_day` at table creation, for example `PARTITION BY RANGE(event_day)`, and a new partition needs to be added after table creation, you can execute:
+
+    ```sql
+    ALTER TABLE site_access ADD PARTITION p4 VALUES LESS THAN ("2020-04-30");
+    ```
+
+  - If the partition column is specified as `datekey` at table creation, for example `PARTITION BY RANGE (datekey)`, and multiple partitions need to be added in batch after table creation, you can execute:
+
+    ```sql
+    ALTER TABLE site_access
+        ADD PARTITIONS START ("2021-01-05") END ("2021-01-10") EVERY (INTERVAL 1 DAY);
+    ```
+
+- List partitions
+
+  - If a single partition column is specified at table creation, for example `PARTITION BY LIST (city)`, and a new partition needs to be added after table creation, you can execute:
+
+    ```sql
+    ALTER TABLE t_recharge_detail2
+    ADD PARTITION pCalifornia VALUES IN ("Los Angeles","San Francisco","San Diego");
+    ```
+
+  - If multiple partition columns are specified at table creation, for example `PARTITION BY LIST (dt,city)`, and a new partition needs to be added after table creation, you can execute:
+
+    ```sql
+    ALTER TABLE t_recharge_detail4 
+    ADD PARTITION p202204_California VALUES IN
+    (
+        ("2022-04-01", "Los Angeles"),
+        ("2022-04-01", "San Francisco"),
+        ("2022-04-02", "Los Angeles"),
+        ("2022-04-02", "San Francisco")
+    );
+    ```
 
 #### Drop a partition
 
@@ -420,9 +490,11 @@ Note:
 - All columns in the index must be written.
 - The value column is listed after the key column.
 
-#### Modify columns of the sort key in a Primary Key table
+#### Modify the sort key
 
-<!--Supported Versions-->
+Since v3.0, the sort keys for the Primary Key tables can be modified. v3.3 extends this support to Duplicate Key tables, Aggregate tables, and Unique Key tables.
+
+The sort keys in Duplicate Key tables and Primary Key tables can be combination of any sort columns. The sort keys in Aggregate tables and Unique Key tables must include all key columns, but the order of the columns does not need to be same as the key columns.
 
 Syntax:
 
@@ -434,9 +506,9 @@ order_desc ::=
     ORDER BY <column_name> [, <column_name> ...]
 ```
 
-Example:
+Example: modify the sort keys in Primary Key tables.
 
-For example, the original table is a Primary Key table where the sort key and  the primary key are coupled, which is `dt, order_id`.
+For example, the original table is a Primary Key table where the sort key and the primary key are coupled, which is `dt, order_id`.
 
 ```SQL
 create table orders (
@@ -612,6 +684,8 @@ Before v3.1, compaction is performed in two ways:
 - Users can perform compaction by calling an HTTP interface.
 
 Starting from v3.1, StarRocks offers a SQL interface for users to manually perform compaction by running SQL commands. They can choose a specific table or partition for compaction. This provides more flexibility and control over the compaction process.
+
+Shared-data clusters support this feature from v3.3.0 onwards.
 
 Syntax:
 

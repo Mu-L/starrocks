@@ -12,7 +12,7 @@ Apache Ranger provides the following core modules:
 - **Agent Plugin**: plugins of components embedded in the Hadoop ecosystem. These plugins pull security policies from Ranger Admin on a regular basis and store the policies in local files. When users access a component, the corresponding plugin assesses the request based on the configured security policy and sends the authentication results to the corresponding component.
 - **User Sync**: used to pull user and user group information, and synchronize the permission data of users and user groups to Ranger's database.
 
-In addition to the native RBAC privilege system, StarRocks v3.1 also supports access control through Apache Ranger, providing a higher level of data security. Currently, StarRocks supports:
+In addition to the native RBAC privilege system, StarRocks v3.1.9 also supports access control through Apache Ranger. Currently, StarRocks supports:
 
 - Creates access policies, masking policies, and row-level filter policies through Apache Ranger.
 - Ranger audit logs.
@@ -31,7 +31,7 @@ After StarRocks is integrating with Apache Ranger, you can achieve the following
 
 - Use Apache Ranger to uniformly manage access to StarRocks internal tables, external tables, and all objects.
 - Use Apache Ranger to manage access to StarRocks internal tables and objects. For External Catalogs, reuse the policy of the corresponding external service on Ranger for access control.
-- Use Apache Ranger to manage access to External Catalogs by reusing the Service corresponding to the external data source. Use StarRocks RBAC privilege system to manage access to StarRocks internal tables and objects.
+- Use Apache Ranger to manage access to External Catalogs by reusing the Service corresponding to the external data source. Use StarRocks native RBAC privilege system to manage access to StarRocks internal tables and objects.
 
 **Authentication process**
 
@@ -44,12 +44,12 @@ After StarRocks is integrating with Apache Ranger, you can achieve the following
 - All StarRocks FE machines have access to Apache Ranger. You can check this by running the following command on each FE machine:
 
    ```SQL
-   telnet <ranger-ip> <ranger-host>
+   telnet <ranger-ip> <ranger-port>
    ```
 
    If `Connected to <ip>` is displayed, the connection is successful.
 
-## Integration procedure
+## Integrate StarRocks Service with Ranger
 
 ### (Optional) Install ranger-starrocks-plugin
 
@@ -57,6 +57,8 @@ After StarRocks is integrating with Apache Ranger, you can achieve the following
 The main purpose of this step is to use Ranger's resource name autocomplete feature. When authoring policies in Ranger Admin, users need to enter the name of the resources whose access need to be protected. To make it easier for users to enter the resource names, Ranger Admin provides the autocomplete feature, which looks up the available resources in the service that match the input entered so far and automatically completes the resource name.
 
 If you do not have the permissions to operate the Ranger cluster or do not need this feature, you can skip this step.
+
+Also, please notice that if you didn't install the ranger-starrocks-plugin, then you cannot use `test connection` when creating StarRocks service. However, that doesn't mean that you can not create the service successfully.
 :::
 
 1. Create the `starrocks` folder in the Ranger Admin directory `ews/webapp/WEB-INF/classes/ranger-plugins`.
@@ -65,7 +67,7 @@ If you do not have the permissions to operate the Ranger cluster or do not need 
    mkdir {path-to-ranger}/ews/webapp/WEB-INF/classes/ranger-plugins/starrocks
    ```
 
-2. Download [plugin-starrocks/target/ranger-starrocks-plugin-3.0.0-SNAPSHOT.jar](https://www.starrocks.io/download/community) and [mysql-connector-j](https://dev.mysql.com/downloads/connector/j/), and place them in the `starrocks` folder.
+2. Download [plugin-starrocks/target/ranger-starrocks-plugin-3.0.0-SNAPSHOT.jar](https://www.starrocks.io/download/community) and [mysql-connector-j.jar](https://dev.mysql.com/downloads/connector/j/), and place them in the `starrocks` folder.
 
 3. Restart Ranger Admin.
 
@@ -74,6 +76,10 @@ If you do not have the permissions to operate the Ranger cluster or do not need 
    ```
 
 ### Configure StarRocks Service on Ranger Admin
+
+:::note
+This step configures the StarRocks Service on Ranger so that users can perform access control on StarRocks objects through Ranger.
+:::
 
 1. Copy [ranger-servicedef-starrocks.json](https://github.com/StarRocks/ranger/blob/master/agents-common/src/main/resources/service-defs/ranger-servicedef-starrocks.json) to any directory of the StarRocks FE machine or Ranger machine.
 
@@ -88,11 +94,17 @@ If you do not have the permissions to operate the Ranger cluster or do not need 
    "implClass": "",
    ```
 
+   If you need Ranger's autocomplete feature (which means you have installed the ranger-starrocks-plugin), you must set `implClass` in the .json file to `org.apache.ranger.services.starrocks.RangerServiceStarRocks`:
+
+   ```JSON
+   "implClass": "org.apache.ranger.services.starrocks.RangerServiceStarRocks",
+   ```
+
    :::
 
 2. Add StarRocks Service by running the following command as a Ranger administrator.
 
-   ```SQL
+   ```Bash
    curl -u <ranger_adminuser>:<ranger_adminpwd> \
    -X POST -H "Accept: application/json" \
    -H "Content-Type: application/json" http://<ranger-ip>:<ranger-port>/service/plugins/definitions -d@ranger-servicedef-starrocks.json
@@ -121,7 +133,7 @@ If you do not have the permissions to operate the Ranger cluster or do not need 
 
    ![added service](../../assets/ranger_added_service.png)
 
-5. Click **Test connection** to test the connectivity, and save it after the connection is successful.
+5. Click **Test connection** to test the connectivity, and save it after the connection is successful. If you didn't install ranger-starrocks-plugin, then you can skip test connection and create directly.
 6. On each FE machine of the StarRocks cluster, create [ranger-starrocks-security.xml](https://github.com/StarRocks/ranger/blob/master/plugin-starrocks/conf/ranger-starrocks-security.xml) in the `fe/conf` folder and copy the content. You must modify the following two parameters and save the modifications:
 
    - `ranger.plugin.starrocks.service.name`: Change to the name of the StarRocks Service you created in Step 4.
@@ -153,14 +165,16 @@ If you do not have the permissions to operate the Ranger cluster or do not need 
    ...
    ```
 
-7. Add the configuration `access_control = ranger` to all FE configuration files.
+7. (Optional) If you want to use the Audit Log service of Ranger, you need to create the [ranger-starrocks-audit.xml](https://github.com/StarRocks/ranger/blob/master/plugin-starrocks/conf/ranger-starrocks-audit.xml) file in the `fe/conf` folder of each FE machine. Copy the content, **replace `solr_url` in `xasecure.audit.solr.solr_url` with your own `solr_url`**, and save the file.
+
+8. Add the configuration `access_control = ranger` to all FE configuration files.
 
    ```SQL
    vim fe.conf
    access_control=ranger 
    ```
 
-8. Restart all FE machines.
+9. Restart all FE machines.
 
    ```SQL
    -- Switch to the FE folder. 
@@ -174,7 +188,7 @@ If you do not have the permissions to operate the Ranger cluster or do not need 
 
 For External Catalog, you can reuse external services (such as Hive Service) for access control. StarRocks supports matching different Ranger external services for different Catalogs. When users access an external table, the system implements access control based on the access policy of the Ranger Service corresponding to the external table. The user permissions are consistent with the Ranger user with the same name.
 
-1. Copy Hive's Ranger configuration files `[ranger-hive-security.xml](https://github.com/StarRocks/ranger/blob/master/hive-agent/conf/ranger-hive-security.xml)` and `[ranger-hive-audit.xml](https://github.com/StarRocks/ranger/blob/master/hive-agent/conf/ranger-hive-audit.xml)` to the `fe/conf` file of all FE machines.
+1. Copy Hive's Ranger configuration files [ranger-hive-security.xml](https://github.com/StarRocks/ranger/blob/master/hive-agent/conf/ranger-hive-security.xml) and [ranger-hive-audit.xml](https://github.com/StarRocks/ranger/blob/master/hive-agent/conf/ranger-hive-audit.xml) to the `fe/conf` file of all FE machines. Make sure Ranger's IP and port are correct.
 2. Restart all FE machines.
 3. Configure External Catalog.
 

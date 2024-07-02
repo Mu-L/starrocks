@@ -16,6 +16,7 @@ package com.starrocks.planner;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
 import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
@@ -33,10 +34,10 @@ import com.starrocks.common.UserException;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.connector.CatalogConnector;
 import com.starrocks.connector.PartitionUtil;
-import com.starrocks.connector.RemoteFileDesc;
 import com.starrocks.connector.RemoteFileInfo;
 import com.starrocks.connector.exception.StarRocksConnectorException;
 import com.starrocks.connector.iceberg.IcebergApiConverter;
+import com.starrocks.connector.iceberg.IcebergRemoteFileDesc;
 import com.starrocks.credential.CloudConfiguration;
 import com.starrocks.credential.CloudConfigurationFactory;
 import com.starrocks.credential.CloudType;
@@ -190,7 +191,7 @@ public class IcebergScanNode extends ScanNode {
             return;
         }
 
-        RemoteFileDesc remoteFileDesc = splits.get(0).getFiles().get(0);
+        IcebergRemoteFileDesc remoteFileDesc = (IcebergRemoteFileDesc) splits.get(0).getFiles().get(0);
         if (remoteFileDesc == null) {
             LOG.warn("There is no scan tasks after planFies on {}.{} and predicate: [{}]",
                     icebergTable.getRemoteDbName(), icebergTable.getRemoteTableName(), predicate);
@@ -302,6 +303,10 @@ public class IcebergScanNode extends ScanNode {
             result.add(scanRangeLocations);
         }
 
+        if (!currentEqualityIds.isEmpty()) {
+            icebergTable.setIdentifierFieldIds(ImmutableSet.copyOf(currentEqualityIds));
+        }
+
         scanNodePredicates.setSelectedPartitionIds(partitionKeyToId.values());
     }
 
@@ -377,8 +382,10 @@ public class IcebergScanNode extends ScanNode {
         }
 
         if (detailLevel == TExplainLevel.VERBOSE && !isResourceMappingCatalog(icebergTable.getCatalogName())) {
+            long snapshotId = icebergTable.getSnapshot().isPresent() ? icebergTable.getSnapshot().get().snapshotId() : -1;
             List<String> partitionNames = GlobalStateMgr.getCurrentState().getMetadataMgr().listPartitionNames(
-                    icebergTable.getCatalogName(), icebergTable.getRemoteDbName(), icebergTable.getRemoteTableName());
+                    icebergTable.getCatalogName(), icebergTable.getRemoteDbName(),
+                    icebergTable.getRemoteTableName(), snapshotId);
 
             output.append(prefix).append(
                     String.format("partitions=%s/%s", scanNodePredicates.getSelectedPartitionIds().size(),

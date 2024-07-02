@@ -61,8 +61,7 @@ INSERT INTO t1 (c0, c1, c2, c3) VALUES
 insert into all_type values('2021-01-01', '2021-01-01 12:00:01.123', 111111, -1.23, 1.54654, 120.26, '测试 test"', '测试\'', ['测试', '测试', 'abc'] );
 
 
-insert /*+ set_user_variable(@a = (select max(c3) from t1)) */ into t2 select /*+ set_user_variable(@b = (select min(c1) from t1)) */
-c0, @b, c2, @a from t1;
+insert into t2 select c0, 'a', c2, 60 from t1;
 
 select @a, @b from t1;
 
@@ -142,3 +141,26 @@ set @test= (select cast(50 as boolean));
 select @test;
 
 set @test= (select cast(50 as time));
+
+set @test= ["{\"m\":{\"cal\":[{\"thur\":{\"use\":true,\"shift\":{\"begin\":0,\"end\":36}},\"id\":\"ID1\"}]}}", "{\"\\a\"}"];
+select @test = ["{\"m\":{\"cal\":[{\"thur\":{\"use\":true,\"shift\":{\"begin\":0,\"end\":36}},\"id\":\"ID1\"}]}}", "{\"\\a\"}"];
+
+set @test= concat(upper('a'), '\\', '"', '\'', 'b');
+select @test = concat(upper('a'), '\\', '"', '\'', 'b');
+
+set @test = ["abc\\"];
+select @test = ["abc\\"];
+
+set @test = ["abc'"];
+select @test = ["abc'"];
+
+set @test = ["abc\\'"];
+select @test = ["abc\\'"];
+
+set @test = concat(upper('a'), '\'', '\\' 'b', '"');
+select @test = concat(upper('a'), '\'', '\\' 'b', '"');
+
+
+
+
+

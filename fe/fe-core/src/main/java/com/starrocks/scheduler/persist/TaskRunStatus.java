@@ -23,6 +23,7 @@ import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.scheduler.Constants;
+import com.starrocks.sql.ast.UserIdentity;
 import org.apache.commons.collections.MapUtils;
 
 import java.io.DataInput;
@@ -50,6 +51,9 @@ public class TaskRunStatus implements Writable {
     @SerializedName("createTime")
     private long createTime;
 
+    @SerializedName("catalogName")
+    private String catalogName;
+
     @SerializedName("dbName")
     private String dbName;
 
@@ -61,7 +65,11 @@ public class TaskRunStatus implements Writable {
     private String postRun;
 
     @SerializedName("user")
+    @Deprecated
     private String user;
+
+    @SerializedName("userIdentity")
+    private UserIdentity userIdentity;
 
     @SerializedName("expireTime")
     private long expireTime;
@@ -103,6 +111,9 @@ public class TaskRunStatus implements Writable {
 
     @SerializedName("mvExtraMessage")
     private volatile MVTaskRunExtraMessage mvTaskRunExtraMessage = new MVTaskRunExtraMessage();
+
+    @SerializedName("dataCacheSelectExtraMessage")
+    private volatile String dataCacheSelectExtraMessage;
 
     @SerializedName("properties")
     private volatile Map<String, String> properties;
@@ -174,6 +185,14 @@ public class TaskRunStatus implements Writable {
         this.progress = progress;
     }
 
+    public String getCatalogName() {
+        return catalogName;
+    }
+
+    public void setCatalogName(String catalogName) {
+        this.catalogName = catalogName;
+    }
+
     public String getDbName() {
         return ClusterNamespace.getNameFromFullName(dbName);
     }
@@ -189,6 +208,14 @@ public class TaskRunStatus implements Writable {
 
     public void setUser(String user) {
         this.user = user;
+    }
+
+    public UserIdentity getUserIdentity() {
+        return userIdentity;
+    }
+
+    public void setUserIdentity(UserIdentity userIdentity) {
+        this.userIdentity = userIdentity;
     }
 
     public String getPostRun() {
@@ -258,6 +285,8 @@ public class TaskRunStatus implements Writable {
     public String getExtraMessage() {
         if (source == Constants.TaskSource.MV) {
             return GsonUtils.GSON.toJson(mvTaskRunExtraMessage);
+        } else if (source == Constants.TaskSource.DATACACHE_SELECT) {
+            return dataCacheSelectExtraMessage;
         } else {
             return "";
         }
@@ -270,6 +299,8 @@ public class TaskRunStatus implements Writable {
         if (source == Constants.TaskSource.MV) {
             this.mvTaskRunExtraMessage =
                     GsonUtils.GSON.fromJson(extraMessage, MVTaskRunExtraMessage.class);
+        } else if (source == Constants.TaskSource.DATACACHE_SELECT) {
+            this.dataCacheSelectExtraMessage = extraMessage;
         } else {
             // do nothing
         }
@@ -281,6 +312,10 @@ public class TaskRunStatus implements Writable {
 
     public void setProcessStartTime(long processStartTime) {
         this.processStartTime = processStartTime;
+        // update process start time in mvTaskRunExtraMessage to display in the web page
+        if (mvTaskRunExtraMessage != null) {
+            mvTaskRunExtraMessage.setProcessStartTime(processStartTime);
+        }
     }
 
     public Map<String, String> getProperties() {

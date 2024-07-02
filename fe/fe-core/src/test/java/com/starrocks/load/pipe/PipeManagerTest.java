@@ -18,7 +18,7 @@ import com.google.common.base.Stopwatch;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.BrokerDesc;
-import com.starrocks.common.AnalysisException;
+import com.starrocks.common.ErrorReportException;
 import com.starrocks.common.LabelAlreadyUsedException;
 import com.starrocks.common.UserException;
 import com.starrocks.common.util.PropertyAnalyzer;
@@ -44,7 +44,6 @@ import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.WarehouseManager;
 import com.starrocks.service.ExecuteEnv;
 import com.starrocks.service.FrontendServiceImpl;
-import com.starrocks.sql.analyzer.PipeAnalyzer;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.ast.pipe.AlterPipeClauseRetry;
@@ -64,6 +63,8 @@ import com.starrocks.transaction.GlobalTransactionMgr;
 import com.starrocks.transaction.TransactionStatus;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
+import com.starrocks.warehouse.DefaultWarehouse;
+import com.starrocks.warehouse.Warehouse;
 import mockit.Expectations;
 import mockit.Mock;
 import mockit.MockUp;
@@ -196,19 +197,14 @@ public class PipeManagerTest {
         // not exists
         String sql = "create pipe p_warehouse properties('warehouse' = 'w1') " +
                 "as insert into tbl select * from files('path'='fake://pipe', 'format'='parquet')";
-        Exception e = Assert.assertThrows(AnalysisException.class, () -> createPipe(sql));
-        Assert.assertEquals("Getting analyzing error. Detail message: Invalid parameter w1.", e.getMessage());
+        Exception e = Assert.assertThrows(ErrorReportException.class, () -> createPipe(sql));
+        Assert.assertEquals("Warehouse name: w1 not exist.", e.getMessage());
 
         // mock the warehouse
-        new MockUp<PipeAnalyzer>() {
-            @Mock
-            public void analyzeWarehouseProperty(String warehouseName) {
-            }
-        };
         new MockUp<WarehouseManager>() {
             @Mock
-            public boolean warehouseExists(String warehouseName) {
-                return true;
+            public Warehouse getWarehouse(String warehouseName) {
+                return new DefaultWarehouse(1000L, "w1");
             }
         };
 
@@ -855,8 +851,7 @@ public class PipeManagerTest {
         // show
         String sql = "show pipes";
         ShowPipeStmt showPipeStmt = (ShowPipeStmt) UtFrameUtils.parseStmtWithNewParser(sql, ctx);
-        ShowExecutor showExecutor = new ShowExecutor();
-        ShowResultSet result = showExecutor.execute(showPipeStmt, ctx);
+        ShowResultSet result = ShowExecutor.execute(showPipeStmt, ctx);
         Assert.assertEquals(
                 Arrays.asList("show_1", "RUNNING", "pipe_test_db.tbl1",
                         "{\"loadedFiles\":0,\"loadedBytes\":0,\"loadingFiles\":0}", null),
@@ -869,8 +864,7 @@ public class PipeManagerTest {
         // desc
         sql = "desc pipe show_1";
         DescPipeStmt descPipeStmt = (DescPipeStmt) UtFrameUtils.parseStmtWithNewParser(sql, ctx);
-        showExecutor = new ShowExecutor();
-        result = showExecutor.execute(descPipeStmt, ctx);
+        result = ShowExecutor.execute(descPipeStmt, ctx);
         Assert.assertEquals(
                 Arrays.asList("show_1", "FILE", "pipe_test_db.tbl1", "FILE_SOURCE(path=fake://pipe)",
                         "insert into tbl1 select * from files('path'='fake://pipe', 'format'='parquet')", ""),
@@ -986,7 +980,7 @@ public class PipeManagerTest {
             piece.addFile(new PipeFileRecord(pipe.getId(), "b.parquet", "v1", 1));
             String sql = FilePipeSource.buildInsertSql(pipe, piece, "insert_label");
             Assert.assertEquals("INSERT INTO `tbl1` WITH LABEL `insert_label` SELECT *\n" +
-                    "FROM FILES('format'='parquet','path'='a.parquet,b.parquet')", sql);
+                    "FROM FILES(\"format\" = \"parquet\", \"path\" = \"a.parquet,b.parquet\")", sql);
             dropPipe(pipeName);
         }
 
@@ -1000,7 +994,7 @@ public class PipeManagerTest {
             piece.addFile(new PipeFileRecord(pipe.getId(), "b.parquet", "v1", 1));
             String sql = FilePipeSource.buildInsertSql(pipe, piece, "insert_label");
             Assert.assertEquals("INSERT INTO `tbl1` WITH LABEL `insert_label` SELECT `col_int`, `col_string`\n" +
-                    "FROM FILES('format'='parquet','path'='a.parquet,b.parquet')", sql);
+                    "FROM FILES(\"format\" = \"parquet\", \"path\" = \"a.parquet,b.parquet\")", sql);
             dropPipe(pipeName);
         }
 
@@ -1016,7 +1010,7 @@ public class PipeManagerTest {
             Assert.assertEquals("INSERT INTO `tbl1` " +
                     "WITH LABEL `insert_label` " +
                     "(`col_int`) SELECT `col_int`\n" +
-                    "FROM FILES('format'='parquet','path'='a.parquet,b.parquet')", sql);
+                    "FROM FILES(\"format\" = \"parquet\", \"path\" = \"a.parquet,b.parquet\")", sql);
             SqlParser.parse(sql, new SessionVariable());
             dropPipe(pipeName);
         }
@@ -1100,6 +1094,6 @@ public class PipeManagerTest {
 
         String sql = "select inspect_all_pipes()";
         String plan = UtFrameUtils.getFragmentPlan(newCtx, sql);
-        Assert.assertTrue(plan.contains("p_inspect"));
+        Assert.assertTrue(plan.contains("name"));
     }
 }

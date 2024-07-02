@@ -18,6 +18,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import com.starrocks.catalog.ColumnId;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
@@ -55,8 +56,8 @@ public class OlapTableTxnStateListener implements TransactionStateListener {
     private Set<Long> totalInvolvedBackends;
     private Set<Long> errorReplicaIds;
     private Set<Long> dirtyPartitionSet;
-    private Set<String> invalidDictCacheColumns;
-    private Map<String, Long> validDictCacheColumns;
+    private Set<ColumnId> invalidDictCacheColumns;
+    private Map<ColumnId, Long> validDictCacheColumns;
 
     public OlapTableTxnStateListener(DatabaseTransactionMgr dbTxnMgr, OlapTable table) {
         this.dbTxnMgr = dbTxnMgr;
@@ -131,7 +132,7 @@ public class OlapTableTxnStateListener implements TransactionStateListener {
                     !tabletCommitInfos.get(i).getValidDictCacheColumns().isEmpty()) {
                 TabletCommitInfo tabletCommitInfo = tabletCommitInfos.get(i);
                 List<Long> validDictCollectedVersions = tabletCommitInfo.getValidDictCollectedVersions();
-                List<String> validDictCacheColumns = tabletCommitInfo.getValidDictCacheColumns();
+                List<ColumnId> validDictCacheColumns = tabletCommitInfo.getValidDictCacheColumns();
                 for (int j = 0; j < validDictCacheColumns.size(); j++) {
                     long version = 0;
                     // validDictCollectedVersions != validDictCacheColumns means be has not upgrade
@@ -258,7 +259,7 @@ public class OlapTableTxnStateListener implements TransactionStateListener {
             long version = -1;
             if (isFirstPartition) {
 
-                List<String> validDictCacheColumnNames = Lists.newArrayList();
+                List<ColumnId> validDictCacheColumnNames = Lists.newArrayList();
                 List<Long> validDictCacheColumnVersions = Lists.newArrayList();
 
                 validDictCacheColumns.forEach((name, dictVersion) -> {
@@ -287,6 +288,11 @@ public class OlapTableTxnStateListener implements TransactionStateListener {
             for (PartitionCommitInfo partitionCommitInfo : tableCommitInfo.getIdToPartitionCommitInfo().values()) {
                 partitionCommitInfo.setVersion(partitionVersions.get(partitionCommitInfo.getPartitionId()));
             }
+        } else if (txnState.isVersionOverwrite()) {
+            for (PartitionCommitInfo partitionCommitInfo : tableCommitInfo.getIdToPartitionCommitInfo().values()) {
+                partitionCommitInfo.setVersion(((InsertTxnCommitAttachment) txnState
+                        .getTxnCommitAttachment()).getPartitionVersion());
+            }
         }
 
         txnState.putIdToTableCommitInfo(table.getId(), tableCommitInfo);
@@ -300,12 +306,12 @@ public class OlapTableTxnStateListener implements TransactionStateListener {
 
     @Override
     public void postAbort(TransactionState txnState, List<TabletCommitInfo> finishedTablets,
-            List<TabletFailInfo> failedTablets) {
+                          List<TabletFailInfo> failedTablets) {
         txnState.clearAutomaticPartitionSnapshot();
         Database db = GlobalStateMgr.getCurrentState().getDb(txnState.getDbId());
         if (db != null) {
             Locker locker = new Locker();
-            locker.lockDatabase(db, LockType.READ);
+            locker.lockTablesWithIntensiveDbLock(db, txnState.getTableIdList(), LockType.READ);
             try {
                 TabletInvertedIndex tabletInvertedIndex = dbTxnMgr.getGlobalStateMgr().getTabletInvertedIndex();
                 // update write failed backend/replica
@@ -329,7 +335,7 @@ public class OlapTableTxnStateListener implements TransactionStateListener {
             } catch (Exception e) {
                 LOG.warn("Fail to execute postAbort", e);
             } finally {
-                locker.unLockDatabase(db, LockType.READ);
+                locker.unLockTablesWithIntensiveDbLock(db, txnState.getTableIdList(), LockType.READ);
             }
         }
 

@@ -221,7 +221,7 @@ public class MaterializedViewManualTest extends MaterializedViewTestBase {
     }
 
     @Test
-    public void testDateTruncPartitionColumnExpr() throws Exception {
+    public void testDateTruncPartitionColumnExpr1() throws Exception {
         String tableSQL = "CREATE TABLE `test_partition_expr_tbl1` (\n" +
                 "  `order_id` bigint(20) NOT NULL DEFAULT \"-1\" COMMENT \"\",\n" +
                 "  `dt` datetime NOT NULL DEFAULT \"1996-01-01 00:00:00\" COMMENT \"\",\n" +
@@ -233,27 +233,12 @@ public class MaterializedViewManualTest extends MaterializedViewTestBase {
                 "PARTITION p2023041017 VALUES [(\"2023-04-10 17:00:00\"), (\"2023-04-10 18:00:00\")),\n" +
                 "PARTITION p2023041021 VALUES [(\"2023-04-10 21:00:00\"), (\"2023-04-10 22:00:00\"))\n" +
                 ")\n" +
-                "DISTRIBUTED BY HASH(`order_id`) BUCKETS 9\n" +
-                "PROPERTIES (\n" +
-                "\"dynamic_partition.enable\" = \"true\",\n" +
-                "\"dynamic_partition.time_unit\" = \"HOUR\",\n" +
-                "\"dynamic_partition.time_zone\" = \"Asia/Shanghai\",\n" +
-                "\"dynamic_partition.start\" = \"-240\",\n" +
-                "\"dynamic_partition.end\" = \"2\",\n" +
-                "\"dynamic_partition.prefix\" = \"p\",\n" +
-                "\"dynamic_partition.buckets\" = \"9\"," +
-                "\"replication_num\" = \"1\"" +
-                ");";
+                "DISTRIBUTED BY HASH(`order_id`)";
         starRocksAssert.withTable(tableSQL);
         String mv = "CREATE MATERIALIZED VIEW `test_partition_expr_mv1`\n" +
-                "COMMENT \"MATERIALIZED_VIEW\"\n" +
                 "PARTITION BY ds \n" +
-                "DISTRIBUTED BY HASH(`order_num`) BUCKETS 10\n" +
-                "PROPERTIES (\n" +
-                "\"replication_num\" = \"1\"" +
-                ")\n" +
-                "AS\n" +
-                "SELECT \n" +
+                "DISTRIBUTED BY RANDOM \n" +
+                "AS SELECT \n" +
                 "count(DISTINCT `order_id`) AS `order_num`, \n" +
                 "date_trunc('minute', `dt`) AS ds\n" +
                 "FROM `test_partition_expr_tbl1`\n" +
@@ -285,6 +270,65 @@ public class MaterializedViewManualTest extends MaterializedViewTestBase {
     }
 
     @Test
+    public void testDateTruncPartitionColumnExpr2() throws Exception {
+        String tableSQL = "CREATE TABLE `test_partition_expr_tbl1` (\n" +
+                "  `order_id` bigint(20) NOT NULL DEFAULT \"-1\" COMMENT \"\",\n" +
+                "  `dt` datetime NOT NULL DEFAULT \"1996-01-01 00:00:00\" COMMENT \"\",\n" +
+                "  `value` varchar(256) NULL \n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(`order_id`, `dt`)\n" +
+                "PARTITION BY RANGE(`dt`)\n" +
+                "(\n" +
+                "PARTITION p2023041017 VALUES [(\"2023-04-10 17:00:00\"), (\"2023-04-10 18:00:00\")),\n" +
+                "PARTITION p2023041021 VALUES [(\"2023-04-10 21:00:00\"), (\"2023-04-10 22:00:00\"))\n" +
+                ")\n" +
+                "DISTRIBUTED BY HASH(`order_id`)";
+        starRocksAssert.withTable(tableSQL);
+        String mv = "CREATE MATERIALIZED VIEW `test_partition_expr_mv1`\n" +
+                "PARTITION BY ds \n" +
+                "DISTRIBUTED BY RANDOM \n" +
+                "AS SELECT \n" +
+                "count(DISTINCT `order_id`) AS `order_num`, \n" +
+                "date_trunc('day', `dt`) AS ds\n" +
+                "FROM `test_partition_expr_tbl1`\n" +
+                "group by ds;";
+        starRocksAssert.withMaterializedView(mv);
+
+        {
+            sql("SELECT \n" +
+                    "count(DISTINCT `order_id`) AS `order_num`, \n" +
+                    "date_trunc('day', `dt`) AS ds \n" +
+                    "FROM `test_partition_expr_tbl1`\n" +
+                    "WHERE date_trunc('month', `dt`) = '2023-04-01'\n" +
+                    "group by ds")
+                    .nonMatch("test_partition_expr_mv1");
+        }
+
+        {
+            sql("SELECT \n" +
+                    "count(DISTINCT `order_id`) AS `order_num`, \n" +
+                    "date_trunc('minute', `dt`) AS ds \n" +
+                    "FROM `test_partition_expr_tbl1`\n" +
+                    "WHERE date_trunc('month', `dt`) BETWEEN '2023-04-01' AND '2023-05-01'\n" +
+                    "group by ds")
+                    .nonMatch("test_partition_expr_mv1");
+        }
+
+        {
+            sql("SELECT \n" +
+                    "count(DISTINCT `order_id`) AS `order_num`, \n" +
+                    "date_trunc('minute', `dt`) AS ds \n" +
+                    "FROM `test_partition_expr_tbl1`\n" +
+                    "WHERE `dt` BETWEEN '2023-04-11' AND '2023-04-12'\n" +
+                    "group by ds")
+                    .nonMatch("test_partition_expr_mv1");
+        }
+
+        starRocksAssert.dropMaterializedView("test_partition_expr_mv1");
+        starRocksAssert.dropTable("test_partition_expr_tbl1");
+    }
+
+    @Test
     public void testMvRewriteForColumnReorder() throws Exception {
         {
             starRocksAssert.withMaterializedView("create materialized view mv0" +
@@ -300,5 +344,52 @@ public class MaterializedViewManualTest extends MaterializedViewTestBase {
             }
             starRocksAssert.dropMaterializedView("mv0");
         }
+    }
+
+    @Test
+    public void testRewriteWithCaseWhen() {
+        starRocksAssert.withMaterializedView("create materialized view mv0" +
+                " distributed by random" +
+                " as select t1a, t1b, sum(t1f) as total from test.test_all_type group by t1a, t1b;", () -> {
+            {
+                String query = "select t1a, sum(if(t1b=0, t1f, 0)) as total from test.test_all_type group by t1a;";
+                sql(query).notContain("mv0");
+            }
+            {
+                String query = "select t1a, sum(if(t1b=0, t1b, 0)) as total from test.test_all_type group by t1a;";
+                sql(query).notContain("mv0");
+            }
+            {
+                String query = "select t1a, sum(if(murmur_hash3_32(t1b %3) = 0, t1b, 0)) as total from test.test_all_type group" +
+                        " by t1a;";
+                sql(query).notContain("mv0");
+            }
+            {
+                String query = "select t1a, sum(case when(t1b=0) then t1b else 0 end) as total from test.test_all_type " +
+                        "group by t1a;";
+                sql(query).notContain("mv0");
+            }
+            {
+                String query = "select t1a, sum(case when(t1b=0) then t1b else 0 end) as total from test.test_all_type " +
+                        "group by t1a;";
+                sql(query).notContain("mv0");
+            }
+        });
+    }
+
+    @Test
+    public void testRewriteWithOnlyGroupByKeys() {
+        starRocksAssert.withMaterializedView("create materialized view mv0" +
+                " distributed by random" +
+                " as select sum(t1f) as total, t1a, t1b from test.test_all_type group by t1a, t1b;", () -> {
+            {
+                String query = "select t1a, sum(t1b) as total from test.test_all_type group by t1a;";
+                sql(query).nonMatch("mv0");
+            }
+            {
+                String query = "select t1a, sum(t1b + 1) as total from test.test_all_type group by t1a;";
+                sql(query).nonMatch("mv0");
+            }
+        });
     }
 }

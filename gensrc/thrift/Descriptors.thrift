@@ -100,6 +100,8 @@ struct TTextFileDesc {
     
     // escape character
     8: optional i8 escape
+
+    9: optional i32 skip_header_line_count
 }
 
 enum TSchemaTableType {
@@ -168,6 +170,7 @@ enum TSchemaTableType {
     SCH_BE_DATACACHE_METRICS,
     SCH_PARTITIONS_META,
     SYS_FE_MEMORY_USAGE,
+    SCH_TEMP_TABLES,
 }
 
 enum THdfsCompression {
@@ -455,6 +458,12 @@ struct TTableFunctionTable {
     6: optional bool write_single_file
 
     7: optional i64 target_max_file_size
+
+    8: optional string csv_row_delimiter
+
+    9: optional string csv_column_seperator
+
+    10: optional bool parquet_use_legacy_encoding
 }
 
 struct TIcebergSchema {

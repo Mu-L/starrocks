@@ -4,11 +4,11 @@ displayed_sidebar: "English"
 
 # array_unique_agg
 
-## Description
+
 
 Aggregates distinct values (including `NULL`) in an ARRAY column into an array (from multiple rows to one row).
 
-This function is supported from v3.1.8.
+This function is supported from v3.2.
 
 ## Syntax
 

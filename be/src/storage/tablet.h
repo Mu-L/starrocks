@@ -108,7 +108,7 @@ public:
     void set_cumulative_layer_point(int64_t new_point);
 
     size_t tablet_footprint(); // disk space occupied by tablet
-    size_t num_rows();
+    size_t num_rows() const override;
     size_t version_count() const;
     Version max_version() const;
 
@@ -156,6 +156,8 @@ public:
     // REQUIRE: `obtain_header_rdlock()`ed
     [[nodiscard]] Status capture_consistent_rowsets(const Version& spec_version,
                                                     vector<RowsetSharedPtr>* rowsets) const;
+
+    [[nodiscard]] Status capture_consistent_rowsets(const int64_t gtid, vector<RowsetSharedPtr>* rowsets) const;
 
     const DelPredicateArray& delete_predicates() const { return _tablet_meta->delete_predicates(); }
     [[nodiscard]] bool version_for_delete_predicate(const Version& version);
@@ -236,6 +238,7 @@ public:
     void pick_candicate_rowsets_to_cumulative_compaction(std::vector<RowsetSharedPtr>* candidate_rowsets);
     void pick_candicate_rowsets_to_base_compaction(std::vector<RowsetSharedPtr>* candidate_rowsets);
     void pick_all_candicate_rowsets(std::vector<RowsetSharedPtr>* candidate_rowsets);
+    void pick_candicate_rowset_before_specify_version(vector<RowsetSharedPtr>* candidcate_rowsets, int64_t version);
 
     void calculate_cumulative_point();
 
@@ -254,7 +257,8 @@ public:
 
     // updatable tablet specific operations
     TabletUpdates* updates() { return _updates.get(); }
-    [[nodiscard]] Status rowset_commit(int64_t version, const RowsetSharedPtr& rowset, uint32_t wait_time = 0);
+    [[nodiscard]] Status rowset_commit(int64_t version, const RowsetSharedPtr& rowset, uint32_t wait_time = 0,
+                                       bool is_version_overwrite = false, bool is_double_write = false);
 
     // if there is _compaction_task running
     // do not do compaction
@@ -307,7 +311,7 @@ public:
 
     const TabletSchemaCSPtr thread_safe_get_tablet_schema() const;
 
-    TabletSchemaCSPtr update_max_version_schema(const TabletSchemaCSPtr& tablet_schema);
+    void update_max_version_schema(const TabletSchemaCSPtr& tablet_schema);
 
     int64_t data_size();
 
@@ -406,6 +410,9 @@ private:
     // These _stale rowsets are been removed when rowsets' pathVersion is expired,
     // this policy is judged and computed by TimestampedVersionTracker.
     std::unordered_map<Version, RowsetSharedPtr, HashOfVersion> _stale_rs_version_map;
+
+    // gtid -> version
+    std::map<int64_t, int64_t> _gtid_to_version_map;
 
     // States used for updatable tablets only
     std::unique_ptr<TabletUpdates> _updates;

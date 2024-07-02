@@ -48,7 +48,16 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 类型：String
 - 单位：-
 - 是否动态：否
-- 描述：以 CIDR 形式指定 BE IP 地址，适用于机器有多个 IP，需要指定优先使用的网络。
+- 描述：为有多个 IP 地址的服务器声明 IP 选择策略。请注意，最多应该有一个 IP 地址与此列表匹配。此参数的值是一个以分号分隔格式的列表，用 CIDR 表示法，例如 `10.10.10.0/24`。如果没有 IP 地址匹配此列表中的条目，系统将随机选择服务器的一个可用 IP 地址。从 v3.3.0 开始，StarRocks 支持基于 IPv6 的部署。如果服务器同时具有 IPv4 和 IPv6 地址，并且未指定此参数，系统将默认使用 IPv4 地址。您可以通过将 `net_use_ipv6_when_priority_networks_empty` 设置为 `true` 来更改此行为。
+- 引入版本：-
+
+##### net_use_ipv6_when_priority_networks_empty
+
+- 默认值：false
+- 类型：Boolean
+- 单位：-
+- 是否动态：否
+- 描述：用于控制在未指定 `priority_networks` 时是否优先使用 IPv6 地址的布尔值。`true` 表示当托管节点的服务器同时具有 IPv4 和 IPv6 地址且未指定 `priority_networks` 时，允许系统优先使用 IPv6 地址。
 - 引入版本：-
 
 ##### mem_limit
@@ -340,8 +349,8 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 默认值：INFO
 - 类型：String
 - 单位：-
-- 是否动态：否
-- 描述：日志级别。有效值：INFO、WARNING、ERROR、FATAL。
+- 是否动态：是（自 v3.3.0、v3.2.7 及 v3.1.12 起）
+- 描述：日志级别。有效值：INFO、WARNING、ERROR、FATAL。自 v3.3.0、v3.2.7 及 v3.1.12 起，该参数变为动态参数。
 - 引入版本：-
 
 ##### sys_log_roll_mode
@@ -1593,11 +1602,11 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 <!--
 ##### stale_memtable_flush_time_sec
 
-- 默认值：30
+- 默认值：0
 - 类型：Int
 - 单位：Seconds
 - 是否动态：是
-- 描述：
+- 描述：0表示禁止，其他上次更新时间大于stale_memtable_flush_time_sec的memtable会在内存不足时持久化
 - 引入版本：-
 -->
 
@@ -1803,6 +1812,16 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 描述：每个 Store 用以 Flush MemTable 的线程数。
 - 引入版本：-
 
+##### lake_flush_thread_num_per_store
+
+- 默认值：0
+- 类型：Int
+- 单位：-
+- 是否动态：是
+- 描述：在存算分离模式下，每个 Store 用以 Flush MemTable 的线程数。当该参数被设置为 `0` 时，系统使用 CPU 核数的两倍。
+当该参数被设置为小于 `0` 时，系统使用该参数的绝对值与 CPU 核数的乘积。
+- 引入版本：3.1.12, 3.2.7
+
 ##### max_runnings_transactions_per_txn_map
 
 - 默认值：100
@@ -1822,7 +1841,6 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 引入版本：v2.5.17, v3.0.9, v3.1.6, v3.2.1
 
 ### 查询引擎
-
 
 ##### scanner_thread_pool_thread_num
 
@@ -2172,6 +2190,15 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 描述：
 - 引入版本：-
 -->
+
+##### query_pool_spill_mem_limit_threshold
+
+- 默认值：1.0
+- 类型：Double
+- 单位：-
+- 是否动态：否
+- 描述：如果开启自动落盘功能, 当所有查询使用的内存超过 `query_pool memory limit * query_pool_spill_mem_limit_threshold` 时，系统触发中间结果落盘。
+- 引入版本：3.2.7
 
 ##### result_buffer_cancelled_interval_time
 
@@ -2729,38 +2756,33 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 引入版本：-
 -->
 
-<!--
 ##### parquet_late_materialization_enable
 
 - 默认值：true
 - 类型：Boolean
 - 单位：-
 - 是否动态：否
-- 描述：
+- 描述：是否使用延迟物化优化 Parquet 读性能。
 - 引入版本：-
--->
 
-<!--
+
 ##### parquet_late_materialization_v2_enable
 
 - 默认值：true
 - 类型：Boolean
 - 单位：-
 - 是否动态：否
-- 描述：
-- 引入版本：-
--->
+- 描述：是否使用 v2 版延迟物化优化 Parquet 读性能。v3.2 版本支持两个版本的 Parquet Reader 延迟物化，v3.3 版本仅保留 `parquet_late_materialization_enable` 延迟物化，并删除该变量。
+- 引入版本：v3.2
 
-<!--
 ##### parquet_page_index_enable
 
 - 默认值：true
 - 类型：Boolean
 - 单位：-
 - 是否动态：否
-- 描述：
-- 引入版本：-
--->
+- 描述：是否使用 Parquet Pageindex 信息优化读性能。
+- 引入版本：v3.3
 
 <!--
 ##### io_coalesce_read_max_buffer_size
@@ -2784,16 +2806,14 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 引入版本：-
 -->
 
-<!--
 ##### io_coalesce_adaptive_lazy_active
 
 - 默认值：true
 - 类型：Boolean
 - 单位：-
 - 是否动态：是
-- 描述：
-- 引入版本：-
--->
+- 描述：根据谓词选择度，自适应决定是否将谓词列 IO 和非谓词列 IO 进行合并。
+- 引入版本：v3.2
 
 <!--
 ##### io_tasks_per_scan_operator
@@ -2970,7 +2990,7 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 默认值：false
 - 类型：Boolean
 - 单位：-
-- 是否动态：是
+- 是否动态：否
 - 描述：是否开启 RFC-3986 编码。从 Google GCS 查询数据时，如果 Object.key 包含特殊字符（例如 `=`，`$`），由于 result URL 未解析这些字符，会导致认证失败。开启 RFC-3986 编码能确保字符正确编码。该特性对于 Hive 分区表非常重要。如果使用 OBS 或 KS3 对象存储，需要在 `be.conf` 开启该参数，不然访问不通。
 - 引入版本：v3.1
 
@@ -3137,6 +3157,51 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 描述：指定 Query Cache 的大小。默认为 512 MB。最小不低于 4 MB。如果当前的 BE 内存容量无法满足您期望的 Query Cache 大小，可以增加 BE 的内存容量，然后再设置合理的 Query Cache 大小。每个 BE 都有自己私有的 Query Cache 存储空间，BE 只 Populate 或 Probe 自己本地的 Query Cache 存储空间。
 - 引入版本：-
 
+##### enable_json_flat
+
+- 默认值：false
+- 类型：Boolean
+- 单位：
+- 是否动态：是
+- 描述：是否开启 Flat JSON 特性。开启后新导入的 JSON 数据会自动打平，提升 JSON 数据查询性能。
+- 引入版本：v3.3.0
+
+##### json_flat_null_factor
+
+- 默认值：0.3
+- 类型：Double
+- 单位：
+- 是否动态：是
+- 描述：控制 Flat JSON 时，提取列的 NULL 值占比阈值，高于该比例不对该列进行提取，默认为 0.3。该参数仅在 `enable_json_flat` 为 `true` 时生效。
+- 引入版本：v3.3.0
+
+##### json_flat_sparsity_factor
+
+- 默认值：0.9
+- 类型：Double
+- 单位：
+- 是否动态：是
+- 描述：控制 Flat JSON 时，同名列的占比阈值，当同名列占比低于该值时不进行提取，默认为 0.9。该参数仅在 `enable_json_flat` 为 `true` 时生效。
+- 引入版本：v3.3.0
+
+##### json_flat_internal_column_min_limit
+
+- 默认值：5
+- 类型：Int
+- 单位：
+- 是否动态：是
+- 描述：控制 Flat JSON 时，JSON 内部字段数量限制，低于该数量的 JSON 不执行 Flat JSON 优化，默认为 5。该参数仅在 `enable_json_flat` 为 `true` 时生效。
+- 引入版本：v3.3.0
+
+##### json_flat_column_max
+
+- 默认值：20
+- 类型：Int
+- 单位：
+- 是否动态：是
+- 描述：控制 Flat JSON 时，最多提取的子列数量，默认为 20。该参数仅在 `enable_json_flat` 为 `true` 时生效。
+- 引入版本：v3.3.0
+
 ### 存算分离
 
 ##### starlet_port
@@ -3145,7 +3210,7 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 类型：Int
 - 单位：-
 - 是否动态：否
-- 描述：存算分离集群中 CN（v3.0 中的 BE）的额外 Agent 服务端口。
+- 描述：BE 和 CN 的额外 Agent 服务端口。
 - 引入版本：-
 
 <!--
@@ -3181,35 +3246,31 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 引入版本：-
 -->
 
-<!--
 ##### starlet_cache_evict_interval
 
 - 默认值：60
 - 类型：Int
-- 单位：
+- 单位：秒
 - 是否动态：是
-- 描述：
-- 引入版本：-
--->
+- 描述：在存算分离模式下启用 file data cache，系统进行缓存淘汰（Cache Eviction）的间隔。
+- 引入版本：v3.0
 
-<!--
 ##### starlet_cache_evict_low_water
 
 - 默认值：0.1
 - 类型：Double
-- 单位：
+- 单位：-
 - 是否动态：是
-- 描述：
-- 引入版本：-
--->
+- 描述：在存算分离模式下启用 file data cache，如果当前剩余磁盘空间（百分比）低于此配置项中指定的值，将会触发缓存淘汰。
+- 引入版本：v3.0
 
 ##### starlet_cache_evict_high_water
 
 - 默认值：0.2
 - 类型：Double
-- 单位：
+- 单位：-
 - 是否动态：是
-- 描述：在存算分离模式下启用 file data cache，如果当前剩余磁盘容量百分比低于此配置项中指定的值，StarRocks 将触发缓存淘汰。默认值表示 file data cache 默认最多使用 80% 磁盘容量。
+- 描述：在存算分离模式下启用 file data cache，如果当前剩余磁盘空间（百分比）高于此配置项中指定的值，将会停止缓存淘汰。
 - 引入版本：v3.0
 
 <!--
@@ -3258,11 +3319,11 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 
 ##### starlet_use_star_cache
 
-- 默认值：true
+- 默认值：false（v3.1）true（v3.2.3 起）
 - 类型：Boolean
 - 单位：-
 - 是否动态：是
-- 描述：存算分离模式下是否使用 block data cache。`true` 表示启用该功能，`false` 表示禁用。
+- 描述：存算分离模式下是否使用 block data cache。`true` 表示启用该功能，`false` 表示禁用。自 v3.2.3 起，默认值由 `false` 调整为 `true`。
 - 引入版本：v3.1
 
 <!--
@@ -3528,7 +3589,7 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 <!--
 ##### lake_vacuum_retry_min_delay_ms
 
-- 默认值：10
+- 默认值：100
 - 类型：Int
 - 单位：Milliseconds
 - 是否动态：是
@@ -3805,6 +3866,69 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 是否动态：否
 - 描述：Block 的元数据存储目录，可自定义。推荐创建在 `$STARROCKS_HOME` 路径下。
 - 引入版本：-
+
+##### datacache_auto_adjust_enable
+
+- 默认值：false
+- 类型：Boolean
+- 单位：-
+- 是否动态：是
+- 描述：Data Cache 磁盘容量自动调整开关，启用后会根据当前磁盘使用率动态调整缓存容量。
+- 引入版本：v3.3.0
+
+##### datacache_disk_high_level
+
+- 默认值：80
+- 类型：Int
+- 单位：-
+- 是否动态：是
+- 描述：Data Cache 磁盘高水位（百分比）。当磁盘使用率高于该值时，系统自动淘汰 Data Cache 中的缓存数据。
+- 引入版本：v3.3.0
+
+##### datacache_disk_safe_level
+
+- 默认值：70
+- 类型：Int
+- 单位：-
+- 是否动态：是
+- 描述：Data Cache 磁盘安全水位（百分比）。当 Data Cache 进行缓存自动扩缩容时，系统将尽可能以该阈值为磁盘使用率目标调整缓存容量。
+- 引入版本：v3.3.0
+
+##### datacache_disk_low_level
+
+- 默认值：60
+- 类型：Int
+- 单位：-
+- 是否动态：是
+- 描述：Data Cache 磁盘低水位（百分比）。当磁盘使用率在 `datacache_disk_idle_seconds_for_expansion` 指定的时间内持续低于该值，且用于缓存数据的空间已经写满时，系统将自动进行缓存扩容，增加缓存上限。
+- 引入版本：v3.3.0
+
+##### datacache_disk_adjust_interval_seconds
+
+- 默认值：10
+- 类型：Int
+- 单位：Seconds
+- 是否动态：是
+- 描述：Data Cache 容量自动调整周期。每隔这段时间系统会进行一次缓存磁盘使用率检测，必要时触发相应扩缩容操作。
+- 引入版本：v3.3.0
+
+##### datacache_disk_idle_seconds_for_expansion
+
+- 默认值：7200
+- 类型：Int
+- 单位：Seconds
+- 是否动态：是
+- 描述：Data Cache 自动扩容最小等待时间。只有当磁盘使用率在 `datacache_disk_low_level` 以下持续时间超过该时长，才会触发自动扩容。
+- 引入版本：v3.3.0
+
+##### datacache_min_disk_quota_for_adjustment
+
+- 默认值：107374182400
+- 类型：Int
+- 单位：Bytes
+- 是否动态：是
+- 描述：Data Cache 自动扩缩容时的最小有效容量。当需要调整的目标容量小于该值时，系统会直接将缓存空间调整为 `0`，以避免缓存空间过小导致频繁填充和淘汰带来负优化。
+- 引入版本：v3.3.0
 
 <!--
 ##### datacache_block_size
@@ -4346,7 +4470,7 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 <!--
 ##### lake_vacuum_min_batch_delete_size
 
-- 默认值：1000
+- 默认值：100
 - 类型：Int
 - 单位：
 - 是否动态：是

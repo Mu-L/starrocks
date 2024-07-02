@@ -253,7 +253,7 @@ StarRocks 访问存储系统的认证配置。
   
     - 如果采用有 Broker 的导入，您需要确保至少部署了一组独立的 Broker，并将 `hdfs-site.xml` 文件放在 HDFS 集群对应的 Broker 节点的 `{deploy}/conf` 目录下。Broker 进程重启时，会将 `{deploy}/conf` 目录添加到 `CLASSPATH` 环境变量，使 Broker 能够读取 HDFS 集群中各节点的信息。
   
-    - 如果采用无 Broker 的导入，您需要将 `hdfs-site.xml` 文件放在每个 FE 节点和每个 BE 节点的 `{deploy}/conf` 目录下。
+    - 如果采用无 Broker 的导入，您需要将 `hdfs-site.xml` 文件放在每个 FE 节点和每个 BE（或 CN）节点的 `{deploy}/conf` 目录下。
 
   - 在单 HDFS 集群、并且配置了多 Kerberos 用户的场景下，只支持有 Broker 的导入。您需要确保至少部署了一组独立的 Broker，并将 `hdfs-site.xml` 文件放在 HDFS 集群对应的 Broker 节点的 `{deploy}/conf` 目录下。Broker 进程重启时，会将 `{deploy}/conf` 目录添加到 `CLASSPATH` 环境变量，使 Broker 能够读取 HDFS 集群中各节点的信息。
 
@@ -647,11 +647,11 @@ PROPERTIES ("<key1>" = "<value1>"[, "<key2>" = "<value2>" ...])
   
   - 取值为 `0` 表示不记录过滤掉的数据行。
   - 取值为 `-1` 表示记录所有过滤掉的数据行。
-  - 取值为大于 0 的正整数（比如 `n`）表示每个 BE 节点上最多可以记录 `n` 条过滤掉的数据行。
+  - 取值为大于 0 的正整数（比如 `n`）表示每个 BE（或 CN）节点上最多可以记录 `n` 条过滤掉的数据行。
 
 - `load_mem_limit`
 
-  导入作业的内存限制，最大不超过 BE 的内存限制。单位：字节。默认内存限制为 2 GB。
+  导入作业的内存限制，最大不超过 BE（或 CN）的内存限制。单位：字节。默认内存限制为 2 GB。
 
 - `strict_mode`
 
@@ -668,6 +668,14 @@ PROPERTIES ("<key1>" = "<value1>"[, "<key2>" = "<value2>" ...])
    已经创建成功的导入作业，如果处于 **QUEUEING** 状态或者 **LOADING** 状态，那么您可以使用 [ALTER LOAD](../data-manipulation/ALTER_LOAD.md) 语句修改该作业的优先级。
 
    StarRocks 自 v2.5 版本起支持为导入作业设置 `priority` 参数。
+
+- `partial_update`
+  
+   是否使用部分列更新。取值包括 `TRUE` 和 `FALSE`。默认值：`FALSE`。
+
+- `partial_update_mode`
+
+  指定部分更新的模式，取值包括 `row` 和 `column`。<ul><li>`row`（默认值），指定使用行模式执行部分更新，比较适用于较多列且小批量的实时更新场景。</li><li>`column`，指定使用列模式执行部分更新，比较适用于少数列并且大量行的批处理更新场景。在该场景，开启列模式，更新速度更快。例如，在一个包含 100 列的表中，每次更新 10 列（占比 10%）并更新所有行，则开启列模式，更新性能将提高 10 倍。</li></ul>
 
 - `merge_condition`
 
@@ -744,6 +752,20 @@ StarRocks 自 3.2.3 版本起支持导入 JSON 格式的数据，相关参数如
 StarRocks v2.4 及以前版本中，如果某一时间段内提交的 Broker Load 作业总数超过最大数量，则超出作业会按照各自的提交时间放到队列中排队等待调度。
 
 自 StarRocks v2.5 版本起，如果某一时间段内提交的 Broker Load 作业总数超过最大数量，则超出的作业会按照作业创建时指定的优先级被放到队列中排队等待调度。参见上面介绍的可选参数 `priority`。您可以使用 [ALTER LOAD](../data-manipulation/ALTER_LOAD.md) 语句修改处于 **QUEUEING** 状态或者 **LOADING** 状态的 Broker Load 作业的优先级。
+
+## 作业拆分与并行执行
+
+一个 Broker Load 作业会拆分成一个或者多个子任务并行处理，一个作业的所有子任务作为一个事务整体成功或失败。作业的拆分通过 `LOAD LABEL` 语句中的 `data_desc` 参数来指定：
+
+- 如果声明多个 `data_desc` 参数对应导入多张不同的表，则每张表数据的导入会拆分成一个子任务。
+
+- 如果声明多个 `data_desc` 参数对应导入同一张表的不同分区，则每个分区数据的导入会拆分成一个子任务。
+
+每个子任务还会拆分成一个或者多个实例，然后这些实例会均匀地被分配到 BE（或 CN）上并行执行。实例的拆分由 FE 配置参数 [`min_bytes_per_broker_scanner`](../../../administration/management/FE_configuration.md) 和 BE（或 CN）节点数量决定，可以使用如下公式计算单个子任务的实例总数：
+
+单个子任务的实例总数 = min（单个子任务待导入数据量的总大小/`min_bytes_per_broker_scanner`, BE/CN 节点数量）
+
+一般情况下，一个导入作业只有一个 `data_desc`，只会拆分成一个子任务，子任务会拆分成与 BE（或 CN）节点数量相等的实例。
 
 ## 示例
 

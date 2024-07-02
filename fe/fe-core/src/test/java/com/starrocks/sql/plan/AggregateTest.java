@@ -20,7 +20,7 @@ import com.starrocks.planner.OlapScanNode;
 import com.starrocks.planner.PlanFragment;
 import com.starrocks.planner.ScanNode;
 import com.starrocks.sql.analyzer.SemanticException;
-import com.starrocks.system.BackendCoreStat;
+import com.starrocks.system.BackendResourceStat;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.utframe.UtFrameUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -205,7 +205,7 @@ public class AggregateTest extends PlanTestBase {
             int cpuCores = 8;
             int expectedTotalDop = cpuCores / 2;
             {
-                BackendCoreStat.setDefaultCoresOfBe(cpuCores);
+                BackendResourceStat.getInstance().setCachedAvgNumHardwareCores(cpuCores);
                 Pair<String, ExecPlan> plan = UtFrameUtils.getPlanAndFragment(connectContext, queryStr);
                 String explainString = plan.second.getExplainString(TExplainLevel.NORMAL);
                 assertContains(explainString, "2:Project\n" +
@@ -256,7 +256,7 @@ public class AggregateTest extends PlanTestBase {
         } finally {
             connectContext.getSessionVariable().setPipelineDop(originPipelineDop);
             connectContext.getSessionVariable().setPipelineDop(originInstanceNum);
-            BackendCoreStat.setDefaultCoresOfBe(1);
+            BackendResourceStat.getInstance().setCachedAvgNumHardwareCores(1);
         }
     }
 
@@ -1658,15 +1658,10 @@ public class AggregateTest extends PlanTestBase {
                 "from supplier having avg(distinct s_suppkey) > 3 ;";
         connectContext.getSessionVariable().setOptimizerExecuteTimeout(-1);
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "30:SELECT\n" +
-                "  |  predicates: 9: avg > 3.0\n" +
-                "  |  \n" +
-                "  29:Project\n" +
-                "  |  <slot 9> : CAST(12: sum AS DOUBLE) / CAST(14: count AS DOUBLE)\n" +
-                "  |  <slot 10> : 10: count\n" +
-                "  |  \n" +
-                "  28:NESTLOOP JOIN\n" +
-                "  |  join op: CROSS JOIN");
+        assertContains(plan, "  28:NESTLOOP JOIN\n" +
+                "  |  join op: INNER JOIN\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  other join predicates: CAST(12: sum AS DOUBLE) / CAST(14: count AS DOUBLE) > 3.0");
     }
 
     @Test
@@ -2710,8 +2705,8 @@ public class AggregateTest extends PlanTestBase {
                 "  |  <slot 8> : 8: count\n" +
                 "  |  <slot 9> : 9: count\n" +
                 "  |  \n" +
-                "  9:AGGREGATE (update finalize)\n" +
-                "  |  output: count(1: v1), count(9: count), max(10: max)\n" +
+                "  9:AGGREGATE (merge finalize)\n" +
+                "  |  output: count(8: count), count(9: count), max(10: max)\n" +
                 "  |  group by: 7: abs\n" +
                 "  |  having: 10: max > CAST(abs(1) AS BIGINT)");
     }
@@ -2737,7 +2732,6 @@ public class AggregateTest extends PlanTestBase {
                 "  |  group by: 1: v1\n" +
                 "  |  having: abs(1) > abs(2)");
 
-
         sql = "select count(*), abs(1) as a, abs(2) as b from t0 group by a + b, v1 having a > b";
         plan = getFragmentPlan(sql);
         assertContains(plan, "2:Project\n" +
@@ -2759,5 +2753,56 @@ public class AggregateTest extends PlanTestBase {
                 "  1:AGGREGATE (update finalize)\n" +
                 "  |  output: max(abs(1))\n" +
                 "  |  group by: 1: v1");
+    }
+
+    @Test
+    public void testMultiCountDistinctWithHavingLimit() throws Exception {
+        String sql = "select count(distinct t1b) as x, count(distinct t1c) as y from test_all_type having x = 2";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  8:AGGREGATE (merge finalize)\n" +
+                "  |  output: count(11: count)\n" +
+                "  |  group by: \n" +
+                "  |  having: 11: count = 2");
+
+        sql = "select count(distinct t1b) as x, count(distinct t1c) as y from test_all_type having x = 2 limit 10";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "  1:AGGREGATE (update finalize)\n" +
+                "  |  output: multi_distinct_count(2: t1b), multi_distinct_count(3: t1c)\n" +
+                "  |  group by: \n" +
+                "  |  having: 11: count = 2\n" +
+                "  |  limit: 10");
+
+        connectContext.getSessionVariable().setOptimizerExecuteTimeout(-1);
+        sql = "select avg(distinct t1b) as x, count(distinct t1c) as y from test_all_type having x = 2 limit 10";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "  1:AGGREGATE (update finalize)\n" +
+                "  |  output: multi_distinct_count(3: t1c), multi_distinct_count(2: t1b), multi_distinct_sum(2: t1b)\n" +
+                "  |  group by: \n" +
+                "  |  having: CAST(14: multi_distinct_sum AS DOUBLE) / CAST(13: multi_distinct_count AS DOUBLE) = 2.0\n" +
+                "  |  limit: 10");
+    }
+
+    @Test
+    public void testAvgDecimalScale() throws Exception {
+        String sql = "select avg(v2 - 1.86659630566164 * (v3 - 3.062175673706)) from t0 group by v1;";
+        String plan = getVerboseExplain(sql);
+        assertContains(plan, "3:Project\n" +
+                "  |  output columns:\n" +
+                "  |  5 <-> [5: avg, DECIMAL128(38,18), true]\n" +
+                "  |  cardinality: 1");
+    }
+
+    @Test
+    public void testHavingAggregate() throws Exception {
+        String sql = "select * from (" +
+                "select sum(v1), f2, v3 from " +
+                "   (select v1, v2, v2 + 2 as f2, v3 from t0) cc " +
+                "group by v2, f2, v3 having (f2 + sum(v1)) > 0" +
+                ") xx ";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  1:AGGREGATE (update finalize)\n" +
+                "  |  output: sum(1: v1)\n" +
+                "  |  group by: 2: v2, 3: v3\n" +
+                "  |  having: 2: v2 + 2 + 5: sum > 0");
     }
 }

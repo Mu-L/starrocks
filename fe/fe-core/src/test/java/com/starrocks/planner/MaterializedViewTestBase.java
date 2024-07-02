@@ -18,6 +18,8 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.MaterializedView;
+import com.starrocks.catalog.MvRefreshArbiter;
+import com.starrocks.catalog.MvUpdateInfo;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.Pair;
 import com.starrocks.scheduler.Task;
@@ -41,7 +43,6 @@ import org.junit.BeforeClass;
 
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -67,6 +68,8 @@ public class MaterializedViewTestBase extends PlanTestBase {
 
         // set default config for async mvs
         UtFrameUtils.setDefaultConfigForAsyncMVTest(connectContext);
+        // set default config for timeliness mvs
+        UtFrameUtils.mockTimelinessForAsyncMVTest(connectContext);
 
         ConnectorPlanTestBase.mockHiveCatalog(connectContext);
 
@@ -74,27 +77,6 @@ public class MaterializedViewTestBase extends PlanTestBase {
             StatisticsMetaManager m = new StatisticsMetaManager();
             m.createStatisticsTablesForTest();
         }
-
-        new MockUp<MaterializedView>() {
-            /**
-             * {@link MaterializedView#getPartitionNamesToRefreshForMv(Set, boolean)}
-             */
-            @Mock
-            public boolean getPartitionNamesToRefreshForMv(Set<String> toRefreshPartitions,
-                                                           boolean isQueryRewrite) {
-                return true;
-            }
-        };
-
-        new MockUp<UtFrameUtils>() {
-            /**
-             * {@link UtFrameUtils#isPrintPlanTableNames()}
-             */
-            @Mock
-            boolean isPrintPlanTableNames() {
-                return true;
-            }
-        };
 
         starRocksAssert.withDatabase(MATERIALIZED_DB_NAME)
                 .useDatabase(MATERIALIZED_DB_NAME);

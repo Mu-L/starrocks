@@ -14,6 +14,7 @@
 
 package com.starrocks.lake;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.staros.client.StarClientException;
 import com.staros.proto.ShardGroupInfo;
@@ -34,12 +35,25 @@ import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Tablet;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.jmockit.Deencapsulation;
+import com.starrocks.common.util.concurrent.lock.LockManager;
+import com.starrocks.proto.DeleteTabletRequest;
+import com.starrocks.proto.DeleteTabletResponse;
+import com.starrocks.proto.StatusPB;
+import com.starrocks.pseudocluster.PseudoBackend;
+import com.starrocks.rpc.BrpcProxy;
+import com.starrocks.rpc.LakeService;
+import com.starrocks.rpc.RpcException;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.LocalMetastore;
 import com.starrocks.server.NodeMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.system.Backend;
 import com.starrocks.system.ComputeNode;
 import com.starrocks.system.SystemInfoService;
+import com.starrocks.thrift.TStatusCode;
+import com.starrocks.warehouse.DefaultWarehouse;
+import com.starrocks.warehouse.Warehouse;
 import mockit.Expectations;
 import mockit.Mock;
 import mockit.MockUp;
@@ -54,6 +68,8 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -79,13 +95,16 @@ public class StarMgrMetaSyncerTest {
     @Mocked
     private LocalMetastore localMetastore;
 
+    @Mocked
+    private WarehouseManager warehouseManager;
+
+    long shardGroupId = 12L;
 
     @Before
     public void setUp() throws Exception {
         long dbId = 1L;
         long tableId = 2L;
         long partitionId = 3L;
-        long shardGroupId = 12L;
 
 
 
@@ -110,6 +129,14 @@ public class StarMgrMetaSyncerTest {
                 globalStateMgr.getStarOSAgent();
                 minTimes = 0;
                 result = starOSAgent;
+
+                globalStateMgr.getWarehouseMgr();
+                minTimes = 0;
+                result = warehouseManager;
+
+                globalStateMgr.getLockManager();
+                minTimes = 0;
+                result = new LockManager();
             }
         };
 
@@ -171,6 +198,34 @@ public class StarMgrMetaSyncerTest {
                 MaterializedIndex baseIndex = new MaterializedIndex();
                 DistributionInfo distributionInfo = new HashDistributionInfo();
                 return Lists.newArrayList(new Partition(partitionId, "p1", baseIndex, distributionInfo, shardGroupId));
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Warehouse getWarehouse(long warehouseId) {
+                return new DefaultWarehouse(WarehouseManager.DEFAULT_WAREHOUSE_ID,
+                        WarehouseManager.DEFAULT_WAREHOUSE_NAME);
+            }
+
+            @Mock
+            public ComputeNode getComputeNode(LakeTablet tablet) {
+                return new ComputeNode(1L, "127.0.0.1", 9030);
+            }
+
+            @Mock
+            public ComputeNode getComputeNode(String warehouseName, LakeTablet tablet) {
+                return new ComputeNode(1L, "127.0.0.1", 9030);
+            }
+
+            @Mock
+            public ComputeNode getComputeNode(Long warehouseId, LakeTablet tablet) {
+                return new ComputeNode(1L, "127.0.0.1", 9030);
+            }
+
+            @Mock
+            public ImmutableMap<Long, ComputeNode> getComputeNodesFromWarehouse(long warehouseId) {
+                return ImmutableMap.of(1L, new ComputeNode(1L, "127.0.0.1", 9030));
             }
         };
     }
@@ -237,7 +292,7 @@ public class StarMgrMetaSyncerTest {
         };
         new MockUp<StarOSAgent>() {
             @Mock
-            public List<String> listDefaultWorkerGroupIpPort() {
+            public List<String> listWorkerGroupIpPort(long workerGroupId) {
                 List<String> addresses = new ArrayList<>();
                 addresses.add("host0:777");
                 addresses.add("host1:888");
@@ -410,5 +465,88 @@ public class StarMgrMetaSyncerTest {
         Assert.assertEquals((long) shards.get(0), 111L);
         Assert.assertEquals((long) shards.get(1), 222L);
         Assert.assertEquals((long) shards.get(2), 333L);
+    }
+
+    @Test
+    public void testDeleteTabletsIgnoreInvalidArgumentError() {
+        Config.shard_group_clean_threshold_sec = 0;
+        long groupIdToClear = shardGroupId + 1;
+        List<Long> allShardGroupId = Lists.newArrayList(groupIdToClear);
+        // build shardGroupInfos
+        List<Long> allShardIds = Stream.of(1000L, 1001L, 1002L, 1003L).collect(Collectors.toList());
+        int numOfShards = allShardIds.size();
+        List<ShardGroupInfo> shardGroupInfos = new ArrayList<>();
+        for (long groupId : allShardGroupId) {
+            ShardGroupInfo info = ShardGroupInfo.newBuilder()
+                    .setGroupId(groupIdToClear)
+                    .putProperties("createTime", String.valueOf(System.currentTimeMillis() - 86400 * 1000))
+                    .addAllShardIds(allShardIds)
+                    .build();
+            shardGroupInfos.add(info);
+        }
+
+        new MockUp<StarOSAgent>() {
+            @Mock
+            public void deleteShardGroup(List<Long> groupIds) throws
+                    StarClientException {
+                allShardGroupId.removeAll(groupIds);
+                for (long groupId : groupIds) {
+                    shardGroupInfos.removeIf(item -> item.getGroupId() == groupId);
+                }
+            }
+            @Mock
+            public List<ShardGroupInfo> listShardGroup() {
+                return shardGroupInfos;
+            }
+
+            @Mock
+            public List<Long> listShard(long groupId) throws DdlException {
+                if (groupId == groupIdToClear) {
+                    return allShardIds;
+                } else {
+                    return Lists.newArrayList();
+                }
+            }
+
+            @Mock
+            public void deleteShards(Set<Long> shardIds) throws DdlException {
+                allShardIds.removeAll(shardIds);
+            }
+        };
+
+        new MockUp<BrpcProxy>() {
+            @Mock
+            public LakeService getLakeService(String host, int port) throws RpcException {
+                return new PseudoBackend.PseudoLakeService();
+            }
+        };
+
+        new MockUp<PseudoBackend.PseudoLakeService>() {
+            @Mock
+            Future<DeleteTabletResponse> deleteTablet(DeleteTabletRequest request) {
+                DeleteTabletResponse resp = new DeleteTabletResponse();
+                resp.status = new StatusPB();
+                resp.status.statusCode = TStatusCode.INTERNAL_ERROR.getValue();
+                resp.failedTablets = new ArrayList<>(request.tabletIds);
+                return CompletableFuture.completedFuture(resp);
+            }
+        };
+        Deencapsulation.invoke(starMgrMetaSyncer, "deleteUnusedShardAndShardGroup");
+        // No shards deleted
+        Assert.assertEquals(numOfShards, allShardIds.size());
+
+        new MockUp<PseudoBackend.PseudoLakeService>() {
+            @Mock
+            Future<DeleteTabletResponse> deleteTablet(DeleteTabletRequest request) {
+                DeleteTabletResponse resp = new DeleteTabletResponse();
+                resp.status = new StatusPB();
+                resp.status.statusCode = TStatusCode.INVALID_ARGUMENT.getValue();
+                resp.failedTablets = new ArrayList<>(request.tabletIds);
+                return CompletableFuture.completedFuture(resp);
+            }
+        };
+        Deencapsulation.invoke(starMgrMetaSyncer, "deleteUnusedShardAndShardGroup");
+        // can delete the shards, because the error is INVALID_ARGUMENT
+        Assert.assertEquals(0, allShardIds.size());
     }
 }

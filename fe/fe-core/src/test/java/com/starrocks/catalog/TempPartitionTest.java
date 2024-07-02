@@ -102,8 +102,7 @@ public class TempPartitionTest {
     private List<List<String>> checkShowPartitionsResultNum(String tbl, boolean isTemp, int expected) throws Exception {
         String showStr = "show " + (isTemp ? "temporary" : "") + " partitions from " + tbl;
         ShowPartitionsStmt showStmt = (ShowPartitionsStmt) UtFrameUtils.parseStmtWithNewParser(showStr, ctx);
-        ShowExecutor executor = new ShowExecutor();
-        ShowResultSet showResultSet = executor.execute(showStmt, ctx);
+        ShowResultSet showResultSet = ShowExecutor.execute(showStmt, ctx);
         List<List<String>> rows = showResultSet.getResultRows();
         Assert.assertEquals(expected, rows.size());
         return rows;
@@ -129,8 +128,7 @@ public class TempPartitionTest {
             throws Exception {
         String showStr = "show tablet from " + tbl + (isTemp ? " temporary" : "") + " partition (" + partitions + ");";
         ShowTabletStmt showStmt = (ShowTabletStmt) UtFrameUtils.parseStmtWithNewParser(showStr, ctx);
-        ShowExecutor executor = new ShowExecutor();
-        ShowResultSet showResultSet = executor.execute(showStmt, ctx);
+        ShowResultSet showResultSet = ShowExecutor.execute(showStmt, ctx);
         List<List<String>> rows = showResultSet.getResultRows();
         if (expected != -1) {
             Assert.assertEquals(expected, rows.size());
@@ -152,8 +150,7 @@ public class TempPartitionTest {
         partNameToTabletId.clear();
         String showStr = "show " + (isTemp ? "temporary" : "") + " partitions from " + tbl;
         ShowPartitionsStmt showStmt = (ShowPartitionsStmt) UtFrameUtils.parseStmtWithNewParser(showStr, ctx);
-        ShowExecutor executor = new ShowExecutor();
-        ShowResultSet showResultSet = executor.execute(showStmt, ctx);
+        ShowResultSet showResultSet = ShowExecutor.execute(showStmt, ctx);
         List<List<String>> rows = showResultSet.getResultRows();
         Map<Long, String> partIdToName = Maps.newHashMap();
         for (List<String> row : rows) {
@@ -384,8 +381,6 @@ public class TempPartitionTest {
         Database db2 = GlobalStateMgr.getCurrentState().getDb("db2");
         OlapTable tbl2 = (OlapTable) db2.getTable("tbl2");
 
-        testSerializeOlapTable(tbl2);
-
         Map<String, Long> originPartitionTabletIds = Maps.newHashMap();
         getPartitionNameToTabletIdMap("db2.tbl2", false, originPartitionTabletIds);
         Assert.assertEquals(3, originPartitionTabletIds.keySet().size());
@@ -423,8 +418,6 @@ public class TempPartitionTest {
 
         System.out.println("partition tablets: " + originPartitionTabletIds);
         System.out.println("temp partition tablets: " + tempPartitionTabletIds);
-
-        testSerializeOlapTable(tbl2);
 
         // drop non exist temp partition
         stmtStr = "alter table db2.tbl2 drop temporary partition tp4;";
@@ -507,7 +500,7 @@ public class TempPartitionTest {
 
         String truncateStr = "truncate table db2.tbl2 partition (p3);";
         TruncateTableStmt truncateTableStmt = (TruncateTableStmt) UtFrameUtils.parseStmtWithNewParser(truncateStr, ctx);
-        GlobalStateMgr.getCurrentState().getLocalMetastore().truncateTable(truncateTableStmt);
+        GlobalStateMgr.getCurrentState().getLocalMetastore().truncateTable(truncateTableStmt, ctx);
         checkShowPartitionsResultNum("db2.tbl2", true, 1);
         checkShowPartitionsResultNum("db2.tbl2", false, 3);
         checkPartitionExist(tbl2, "tp1", false, true);
@@ -591,7 +584,7 @@ public class TempPartitionTest {
 
         truncateStr = "truncate table db2.tbl2";
         truncateTableStmt = (TruncateTableStmt) UtFrameUtils.parseStmtWithNewParser(truncateStr, ctx);
-        GlobalStateMgr.getCurrentState().getLocalMetastore().truncateTable(truncateTableStmt);
+        GlobalStateMgr.getCurrentState().getLocalMetastore().truncateTable(truncateTableStmt, ctx);
         checkShowPartitionsResultNum("db2.tbl2", false, 3);
         checkShowPartitionsResultNum("db2.tbl2", true, 0);
 
@@ -699,7 +692,7 @@ public class TempPartitionTest {
         // now base range is [min, 10), [10, 15), [15, 25), [25, 30) -> p1,tp1,tp2,tp3
         stmtStr = "truncate table db3.tbl3";
         TruncateTableStmt truncateTableStmt = (TruncateTableStmt) UtFrameUtils.parseStmtWithNewParser(stmtStr, ctx);
-        GlobalStateMgr.getCurrentState().getLocalMetastore().truncateTable(truncateTableStmt);
+        GlobalStateMgr.getCurrentState().getLocalMetastore().truncateTable(truncateTableStmt, ctx);
         // 2. add temp ranges: [10, 31), and replace the [10, 15), [15, 25), [25, 30)
         stmtStr = "alter table db3.tbl3 add temporary partition tp4 values [('10'), ('31'))";
         alterTableWithNewAnalyzer(stmtStr, false);
@@ -716,7 +709,7 @@ public class TempPartitionTest {
         // now base range is [min, 10), [10, 30) -> p1,tp4
         stmtStr = "truncate table db3.tbl3";
         truncateTableStmt = (TruncateTableStmt) UtFrameUtils.parseStmtWithNewParser(stmtStr, ctx);
-        GlobalStateMgr.getCurrentState().getLocalMetastore().truncateTable(truncateTableStmt);
+        GlobalStateMgr.getCurrentState().getLocalMetastore().truncateTable(truncateTableStmt, ctx);
         // 3. add temp partition tp5 [50, 60) and replace partition tp4
         stmtStr = "alter table db3.tbl3 add temporary partition tp5 values [('50'), ('60'))";
         alterTableWithNewAnalyzer(stmtStr, false);
@@ -767,25 +760,6 @@ public class TempPartitionTest {
             FeConstants.runningUnitTest = flag;
         }
 
-    }
-
-    private void testSerializeOlapTable(OlapTable tbl) throws IOException, AnalysisException {
-        // 1. Write objects to file
-        File file = new File(tempPartitionFile);
-        file.createNewFile();
-        DataOutputStream out = new DataOutputStream(new FileOutputStream(file));
-
-        tbl.write(out);
-        out.flush();
-        out.close();
-
-        // 2. Read objects from file
-        DataInputStream in = new DataInputStream(new FileInputStream(file));
-
-        OlapTable readTbl = (OlapTable) Table.read(in);
-        Assert.assertEquals(tbl.getId(), readTbl.getId());
-        Assert.assertEquals(tbl.getTempPartitions().size(), readTbl.getTempPartitions().size());
-        file.delete();
     }
 
     private void testSerializeTempPartitions(TempPartitions tempPartitionsInstance)

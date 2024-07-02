@@ -48,6 +48,7 @@ set(EXPR_FILES
   array_element_expr.cpp
   array_expr.cpp
   array_functions.cpp
+  arrow_function_call.cpp
   binary_predicate.cpp
   bitmap_functions.cpp
   case_expr.cpp
@@ -104,6 +105,7 @@ set(EXPR_FILES
   runtime_filter_layout.cpp
   dictionary_get_expr.cpp
   ngram.cpp
+  match_expr.cpp
 )
 
 add_library(Exprs ${EXPR_FILES})

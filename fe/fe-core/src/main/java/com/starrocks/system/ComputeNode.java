@@ -14,6 +14,7 @@
 
 package com.starrocks.system;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Objects;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.alter.DecommissionType;
@@ -29,6 +30,7 @@ import com.starrocks.qe.CoordinatorMonitor;
 import com.starrocks.qe.GlobalVariable;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.RunMode;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TResourceGroupUsage;
 import org.apache.logging.log4j.LogManager;
@@ -70,8 +72,11 @@ public class ComputeNode implements IComputable, Writable {
     private volatile int beRpcPort; // be rpc port
     @SerializedName("brpcPort")
     private volatile int brpcPort = -1;
+
     @SerializedName("cpuCores")
     private volatile int cpuCores = 0; // Cpu cores of node
+    @SerializedName("mlb")
+    private volatile long memLimitBytes = 0;
 
     @SerializedName("lastUpdateMs")
     private volatile long lastUpdateMs;
@@ -105,6 +110,11 @@ public class ComputeNode implements IComputable, Writable {
     @SerializedName("lastWriteFail")
     private volatile boolean lastWriteFail = false;
 
+    @SerializedName("workerGroupId")
+    private long workerGroupId = 0;
+
+    @SerializedName("warehouseId")
+    private long warehouseId = WarehouseManager.DEFAULT_WAREHOUSE_ID;
     // Indicate there is whether storage_path or not with CN node
     // It must be true for Backend
     @SerializedName("isSetStoragePath")
@@ -113,7 +123,6 @@ public class ComputeNode implements IComputable, Writable {
     private volatile DataCacheMetrics dataCacheMetrics = null;
 
     private volatile int numRunningQueries = 0;
-    private volatile long memLimitBytes = 0;
     private volatile long memUsedBytes = 0;
     private volatile int cpuUsedPermille = 0;
     private volatile long lastUpdateResourceUsageMs = 0;
@@ -237,6 +246,22 @@ public class ComputeNode implements IComputable, Writable {
         return heartbeatErrMsg;
     }
 
+    public long getWorkerGroupId() {
+        return workerGroupId;
+    }
+
+    public void setWorkerGroupId(long workerGroupId) {
+        this.workerGroupId = workerGroupId;
+    }
+
+    public void setWarehouseId(long warehouseId) {
+        this.warehouseId = warehouseId;
+    }
+
+    public long getWarehouseId() {
+        return warehouseId;
+    }
+
     // for test only
     public void updateOnce(int bePort, int httpPort, int beRpcPort) {
         if (this.bePort != bePort) {
@@ -330,16 +355,8 @@ public class ComputeNode implements IComputable, Writable {
         return this.isAlive.get();
     }
 
-    public void setIsAlive(boolean isAlive) {
-        this.isAlive.set(isAlive);
-    }
-
     public boolean isDecommissioned() {
         return this.isDecommissioned.get();
-    }
-
-    public void setIsDecommissioned(boolean isDecommissioned) {
-        this.isDecommissioned.set(isDecommissioned);
     }
 
     public boolean isAvailable() {
@@ -369,11 +386,9 @@ public class ComputeNode implements IComputable, Writable {
         return cpuUsedPermille;
     }
 
-    public void updateResourceUsage(int numRunningQueries, long memLimitBytes, long memUsedBytes,
-                                    int cpuUsedPermille) {
-
+    public void updateResourceUsage(int numRunningQueries, long memUsedBytes, int cpuUsedPermille) {
         this.numRunningQueries = numRunningQueries;
-        this.memLimitBytes = memLimitBytes;
+        // memLimitBytes is set by heartbeats instead of reports.
         this.memUsedBytes = memUsedBytes;
         this.cpuUsedPermille = cpuUsedPermille;
         this.lastUpdateResourceUsageMs = System.currentTimeMillis();
@@ -451,10 +466,6 @@ public class ComputeNode implements IComputable, Writable {
         return isAlive;
     }
 
-    public void setIsAlive(AtomicBoolean isAlive) {
-        this.isAlive = isAlive;
-    }
-
     public void setDecommissionType(int decommissionType) {
         this.decommissionType = decommissionType;
     }
@@ -472,6 +483,16 @@ public class ComputeNode implements IComputable, Writable {
 
     public int getCpuCores() {
         return cpuCores;
+    }
+
+    @VisibleForTesting
+    public void setCpuCores(int cpuCores) {
+        this.cpuCores = cpuCores;
+    }
+
+    @VisibleForTesting
+    public void setMemLimitBytes(long memLimitBytes) {
+        this.memLimitBytes = memLimitBytes;
     }
 
     /**
@@ -542,7 +563,17 @@ public class ComputeNode implements IComputable, Writable {
 
                 // BackendCoreStat is a global state, checkpoint should not modify it.
                 if (!GlobalStateMgr.isCheckpointThread()) {
-                    BackendCoreStat.setNumOfHardwareCoresOfBe(hbResponse.getBeId(), hbResponse.getCpuCores());
+                    BackendResourceStat.getInstance().setNumHardwareCoresOfBe(hbResponse.getBeId(), hbResponse.getCpuCores());
+                }
+            }
+
+            if (this.memLimitBytes != hbResponse.getMemLimitBytes()) {
+                isChanged = true;
+                this.memLimitBytes = hbResponse.getMemLimitBytes();
+
+                // BackendCoreStat is a global state, checkpoint should not modify it.
+                if (!GlobalStateMgr.isCheckpointThread()) {
+                    BackendResourceStat.getInstance().setMemLimitBytesOfBe(hbResponse.getBeId(), hbResponse.getMemLimitBytes());
                 }
             }
 

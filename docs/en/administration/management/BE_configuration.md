@@ -48,8 +48,17 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Type: String
 - Unit: -
 - Is mutable: No
-- Description: The CIDR-formatted IP address that is used to specify the priority IP address of a BE node if the machine that hosts the BE node has multiple IP addresses.
+- Description: Declares a selection strategy for servers that have multiple IP addresses. Note that at most one IP address must match the list specified by this parameter. The value of this parameter is a list that consists of entries, which are separated with semicolons (;) in CIDR notation, such as `10.10.10.0/24`. If no IP address matches the entries in this list, an available IP address of the server will be randomly selected. From v3.3.0, StarRocks supports deployment based on IPv6. If the server has both IPv4 and IPv6 addresses, and this parameter is not specified, the system uses an IPv4 address by default. You can change this behavior by setting `net_use_ipv6_when_priority_networks_empty` to `true`.
 - Introduced in: -
+
+##### net_use_ipv6_when_priority_networks_empty
+
+- Default: false
+- Type: Boolean
+- Unit: -
+- Is mutable: No
+- Description: A boolean value to control whether to use IPv6 addresses preferentially when `priority_networks` is not specified. `true` indicates to allow the system to use an IPv6 address preferentially when the server that hosts the node has both IPv4 and IPv6 addresses and `priority_networks` is not specified.
+- Introduced in: v3.3.0
 
 ##### mem_limit
 
@@ -340,8 +349,8 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Default: INFO
 - Type: String
 - Unit: -
-- Is mutable: No
-- Description: The severity levels into which system log entries are classified. Valid values: INFO, WARN, ERROR, and FATAL.
+- Is mutable: Yes (from v3.3.0, v3.2.7, and v3.1.12)
+- Description: The severity levels into which system log entries are classified. Valid values: INFO, WARN, ERROR, and FATAL. This item was changed to a dynamic configuration from v3.3.0, v3.2.7, and v3.1.12 onwards.
 - Introduced in: -
 
 ##### sys_log_roll_mode
@@ -1653,11 +1662,11 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 <!--
 ##### stale_memtable_flush_time_sec
 
-- Default: 30
+- Default: 0
 - Type: Int
 - Unit: Seconds
 - Is mutable: Yes
-- Description:
+- Description: 0 means prohibited. Other memtables whose last update time is greater than stale_memtable_flush_time_sec will be persisted when memory is insufficient.
 - Introduced in: -
 -->
 
@@ -1862,6 +1871,17 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Is mutable: Yes
 - Description: Number of threads that are used for flushing MemTable in each store.
 - Introduced in: -
+
+##### lake_flush_thread_num_per_store
+
+- Default: 0
+- Type: Int
+- Unit: -
+- Is mutable: Yes
+- Description: Number of threads that are used for flushing MemTable in each store in shared-data mode. 
+When this value is set to `0`, the system uses twice of the CPU core count as the value.
+When this value is set to less than `0`, the system uses the product of its absolute value and the CPU core count as the value.
+- Introduced in: 3.1.12, 3.2.7
 
 ##### max_runnings_transactions_per_txn_map
 
@@ -2230,6 +2250,15 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Description:
 - Introduced in: -
 -->
+
+##### query_pool_spill_mem_limit_threshold
+
+- Default: 1.0
+- Type: Double
+- Unit: -
+- Is mutable: No
+- Description: If automatic spilling is enabled, when the memory usage of all queries exceeds `query_pool memory limit * query_pool_spill_mem_limit_threshold`, intermediate result spilling will be triggered.
+- Introduced in: v3.2.7
 
 ##### result_buffer_cancelled_interval_time
 
@@ -2783,38 +2812,32 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Introduced in: -
 -->
 
-<!--
 ##### parquet_late_materialization_enable
 
 - Default: true
 - Type: Boolean
 - Unit: -
 - Is mutable: No
-- Description:
+- Description: A boolean value to control whether to enable the late materialization of Parquet reader to improve performance. `true` indicates enabling late materialization, and `false` indicates disabling it.
 - Introduced in: -
--->
 
-<!--
 ##### parquet_late_materialization_v2_enable
 
 - Default: true
 - Type: Boolean
 - Unit: -
 - Is mutable: No
-- Description:
-- Introduced in: -
--->
+- Description: A boolean value to control whether to enable the late materialization v2 of Parquet reader to improve performance. `true` indicates enabling late materialization v2, and `false` indicates disabling it. In v3.3, only `parquet_late_materialization_enable` is used, and this variable is deprecated.
+- Introduced in: v3.2
 
-<!--
 ##### parquet_page_index_enable
 
 - Default: true
 - Type: Boolean
 - Unit: -
 - Is mutable: No
-- Description:
-- Introduced in: -
--->
+- Description: A boolean value to control whether to enable the pageindex of Parquet file to improve performance. `true` indicates enabling pageindex, and `false` indicates disabling it.
+- Introduced in: v3.3
 
 <!--
 ##### io_coalesce_read_max_buffer_size
@@ -2838,16 +2861,14 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Introduced in: -
 -->
 
-<!--
 ##### io_coalesce_adaptive_lazy_active
 
 - Default: true
 - Type: Boolean
 - Unit: -
 - Is mutable: Yes
-- Description:
-- Introduced in: -
--->
+- Description: Based on the selectivity of predicates, adaptively determines whether to combine the I/O of predicate columns and non-predicate columns.
+- Introduced in: v3.2
 
 <!--
 ##### io_tasks_per_scan_operator
@@ -3025,7 +3046,7 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Default: false
 - Type: Boolean
 - Unit: -
-- Is mutable: Yes
+- Is mutable: No
 - Description:
 - Introduced in: -
 -->
@@ -3193,6 +3214,51 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Description: The size of the query cache in the BE. The default size is 512 MB. The size cannot be less than 4 MB. If the memory capacity of the BE is insufficient to provision your expected query cache size, you can increase the memory capacity of the BE.
 - Introduced in: -
 
+##### enable_json_flat
+
+- Default: false
+- Type: Boolean
+- Unit:
+- Is mutable: Yes
+- Description: Whether to enable the Flat JSON feature. After this feature is enabled, newly loaded JSON data will be automatically flattened, improving JSON query performance.
+- Introduced in: v3.3.0
+
+##### json_flat_null_factor
+
+- Default: 0.3
+- Type: Double
+- Unit:
+- Is mutable: Yes
+- Description: The proportion of NULL values in the column to extract for Flat JSON. A column will not be extracted if its proportion of NULL value is higher than this threshold. This parameter takes effect only when `enable_json_flat` is set to `true`.
+- Introduced in: v3.3.0
+
+##### json_flat_sparsity_factor
+
+- Default: 0.9
+- Type: Double
+- Unit:
+- Is mutable: Yes
+- Description: The proportion of columns with the same name for Flat JSON. Extraction is not performed if the proportion of columns with the same name is lower than this value. This parameter takes effect only when `enable_json_flat` is set to `true`.
+- Introduced in: v3.3.0
+
+##### json_flat_internal_column_min_limit
+
+- Default: 5
+- Type: Int
+- Unit:
+- Is mutable: Yes
+- Description: The minimum number of JSON fields for performing Flat JSON. Flat JSON is not performed if the number of JSON fields is less than this value. This parameter takes effect only when `enable_json_flat` is set to `true`.
+- Introduced in: v3.3.0
+
+##### json_flat_column_max
+
+- Default: 20
+- Type: Int
+- Unit:
+- Is mutable: Yes
+- Description: The maximum number of sub-fields that can be extracted by Flat JSON. This parameter takes effect only when `enable_json_flat` is set to `true`.
+- Introduced in: v3.3.0
+
 ### Shared-data
 
 ##### starlet_port
@@ -3201,7 +3267,7 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Type: Int
 - Unit: -
 - Is mutable: No
-- Description: An extra agent service port for CN (BE in v3.0) in a shared-data cluster.
+- Description: An extra agent service port for BE and CN.
 - Introduced in: -
 
 <!--
@@ -3237,35 +3303,31 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Introduced in: -
 -->
 
-<!--
 ##### starlet_cache_evict_interval
 
 - Default: 60
 - Type: Int
-- Unit:
+- Unit: Seconds
 - Is mutable: Yes
-- Description:
-- Introduced in: -
--->
+- Description: The interval at which the system performs cache eviction in a shared-data cluster with file data cache enabled.
+- Introduced in: v3.0
 
-<!--
 ##### starlet_cache_evict_low_water
 
 - Default: 0.1
 - Type: Double
-- Unit:
+- Unit: -
 - Is mutable: Yes
-- Description:
-- Introduced in: -
--->
+- Description: The low water at which cache eviction is triggered. In a shared-data cluster with file data cache enabled, if the percentage of available disk space is lower than this value, cache eviction will be triggered.
+- Introduced in: v3.0
 
 ##### starlet_cache_evict_high_water
 
 - Default: 0.2
 - Type: Double
-- Unit:
+- Unit: -
 - Is mutable: Yes
-- Description: In a shared-data cluster, if the percentage of the available disk capacity is below this value, file data cache eviction will be triggered. The default value indicates that file data cache will use at most 80% of the disk capacity.
+- Description: The high water at which cache eviction is stopped. In a shared-data cluster with file data cache enabled, if the percentage of available disk space is higher than this value, cache eviction will be stopped.
 - Introduced in: v3.0
 
 <!--
@@ -3314,11 +3376,11 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 
 ##### starlet_use_star_cache
 
-- Default: true
+- Default: false in v3.1 and true from v3.2.3
 - Type: Boolean
 - Unit: -
 - Is mutable: Yes
-- Description: Whether to enable block data cache in a shared-data cluster. `true` indicates enabling this feature and `false` indicates disabling it.
+- Description: Whether to enable block data cache in a shared-data cluster. `true` indicates enabling this feature and `false` indicates disabling it. The default value is set from `false` to `true` from v3.2.3 onwards.
 - Introduced in: v3.1
 
 <!--
@@ -3584,7 +3646,7 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 <!--
 ##### lake_vacuum_retry_min_delay_ms
 
-- Default: 10
+- Default: 100
 - Type: Int
 - Unit: Milliseconds
 - Is mutable: Yes
@@ -3861,6 +3923,69 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - Is mutable: No
 - Description: The storage path of block metadata. You can customize the storage path. We recommend that you store the metadata under the `$STARROCKS_HOME` path.
 - Introduced in: -
+
+##### datacache_auto_adjust_enable
+
+- Default: false
+- Type: Boolean
+- Unit: -
+- Is mutable: Yes
+- Description: Whether to enable Automatic Scaling for Data Cache disk capacity. When it is enabled, the system dynamically adjusts the cache capacity based on the current disk usage rate.
+- Introduced in: v3.3.0
+
+##### datacache_disk_high_level
+
+- Default: 80
+- Type: Int
+- Unit: -
+- Is mutable: Yes
+- Description: The upper limit of disk usage (in percentage) that triggers the automatic scaling up of the cache capacity. When the disk usage exceeds this value, the system automatically evicts cache data from the Data Cache.
+- Introduced in: v3.3.0
+
+##### datacache_disk_safe_level
+
+- Default: 70
+- Type: Int
+- Unit: -
+- Is mutable: Yes
+- Description: The safe level of disk usage (in percentage) for Data Cache. When Data Cache performs automatic scaling, the system adjusts the cache capacity with the goal of maintaining disk usage as close to this value as possible.
+- Introduced in: v3.3.0
+
+##### datacache_disk_low_level
+
+- Default: 60
+- Type: Int
+- Unit: -
+- Is mutable: Yes
+- Description: The lower limit of disk usage (in percentage) that triggers the automatic scaling down of the cache capacity. When the disk usage remains below this value for the period specified in `datacache_disk_idle_seconds_for_expansion`, and the space allocated for Data Cache is fully utilized, the system will automatically expand the cache capacity by increasing the upper limit.
+- Introduced in: v3.3.0
+
+##### datacache_disk_adjust_interval_seconds
+
+- Default: 10
+- Type: Int
+- Unit: Seconds
+- Is mutable: Yes
+- Description: The interval of Data Cache automatic capacity scaling. At regular intervals, the system checks the cache disk usage, and triggers Automatic Scaling when necessary.
+- Introduced in: v3.3.0
+
+##### datacache_disk_idle_seconds_for_expansion
+
+- Default: 7200
+- Type: Int
+- Unit: Seconds
+- Is mutable: Yes
+- Description: The minimum wait time for Data Cache automatic expansion. Automatic scaling up is triggered only if the disk usage remains below `datacache_disk_low_level` for longer than this duration.
+- Introduced in: v3.3.0
+
+##### datacache_min_disk_quota_for_adjustment
+
+- Default: 107374182400
+- Type: Int
+- Unit: Bytes
+- Is mutable: Yes
+- Description: The minimum effective capacity for Data Cache Automatic Scaling. If the system tries to adjust the cache capacity to less than this value, the cache capacity will be directly set to `0` to prevent suboptimal performance caused by frequent cache fills and evictions due to insufficient cache capacity.
+- Introduced in: v3.3.0
 
 <!--
 ##### datacache_block_size
@@ -4402,7 +4527,7 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 <!--
 ##### lake_vacuum_min_batch_delete_size
 
-- Default: 1000
+- Default: 100
 - Type: Int
 - Unit:
 - Is mutable: Yes

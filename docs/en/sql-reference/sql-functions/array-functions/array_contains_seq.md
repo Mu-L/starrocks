@@ -4,7 +4,7 @@ displayed_sidebar: "English"
 
 # array_contains_seq
 
-## Description
+
 
 Checks whether all the elements of `arr2` appear in `arr1` in the same exact order, that is, whether `arr2` is a subset of `arr1` and the elements in `arr2` observe the same exact order as elements in `arr1`. If yes, this function will return 1.
 
@@ -13,7 +13,7 @@ For example:
 - `select array_contains_seq([1,2,3,4], [1,2,3]);` returns 1.
 - `select array_contains_seq([1,2,3,4], [4,3]);` returns 0.
 
-This function is supported from v3.2.
+This function is supported from v3.3 onwards.
 
 ## Syntax
 

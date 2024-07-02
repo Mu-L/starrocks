@@ -63,13 +63,15 @@ import java.util.stream.Collectors;
 
 import static com.starrocks.sql.optimizer.transformer.SqlToScalarOperatorTranslator.findOrCreateColumnRefForExpr;
 
-class QueryTransformer {
+public class QueryTransformer {
     private final ColumnRefFactory columnRefFactory;
     private final ConnectContext session;
     private final List<ColumnRefOperator> correlation = new ArrayList<>();
     private final CTETransformerContext cteContext;
     private final boolean inlineView;
     private final Map<Operator, ParseNode> optToAstMap;
+    public static final String GROUPING_ID = "GROUPING_ID";
+    public static final String GROUPING = "GROUPING";
 
     public QueryTransformer(ColumnRefFactory columnRefFactory, ConnectContext session,
                             CTETransformerContext cteContext, boolean inlineView,
@@ -290,10 +292,22 @@ class QueryTransformer {
         }
 
         final ExpressionMapping expressionMapping = subOpt.getExpressionMapping();
-        boolean allColumnRef = projectExpressions.stream()
-                .map(expression -> SqlToScalarOperatorTranslator.translate(expression, expressionMapping,
-                        columnRefFactory))
-                .allMatch(ScalarOperator::isColumnRef);
+        boolean allColumnRef = true;
+        Map<Expr, ColumnRefOperator> tempMapping = new HashMap<>();
+        for (Expr expression : projectExpressions) {
+            ScalarOperator operator = SqlToScalarOperatorTranslator.translate(expression, expressionMapping,
+                    columnRefFactory);
+            if (!operator.isColumnRef()) {
+                allColumnRef = false;
+                tempMapping.clear();
+                break;
+            } else {
+                tempMapping.put(expression, (ColumnRefOperator) operator);
+            }
+        }
+        if (allColumnRef) {
+            expressionMapping.getExpressionToColumns().putAll(tempMapping);
+        }
 
         /*
          * If there is no expression calculate in partition and order by,
@@ -369,7 +383,7 @@ class QueryTransformer {
     public OptExprBuilder aggregate(OptExprBuilder subOpt,
                                      List<Expr> groupByExpressions, List<FunctionCallExpr> aggregates,
                                      List<List<Expr>> groupingSetsList, List<Expr> groupingFunctionCallExprs) {
-        if (aggregates.size() == 0 && groupByExpressions.size() == 0) {
+        if (aggregates.isEmpty() && groupByExpressions.isEmpty()) {
             return subOpt;
         }
 
@@ -485,7 +499,7 @@ class QueryTransformer {
             }
 
             //Build grouping_id(all grouping columns)
-            ColumnRefOperator grouping = columnRefFactory.create("GROUPING_ID", Type.BIGINT, false);
+            ColumnRefOperator grouping = columnRefFactory.create(GROUPING_ID, Type.BIGINT, false);
             List<Long> groupingID = new ArrayList<>();
             for (BitSet bitSet : groupingIdsBitSets) {
                 long gid = Utils.convertBitSetToLong(bitSet, groupByColumnRefs.size());
@@ -496,7 +510,7 @@ class QueryTransformer {
                 // causing the data to be aggregated in advance.
                 // So add pow here to ensure that the grouping_id is not repeated, to ensure that the data will not be aggregated in advance
                 while (groupingID.contains(gid)) {
-                    gid += Math.pow(2, groupByColumnRefs.size());
+                    gid += (1L << groupByColumnRefs.size());
                 }
                 groupingID.add(gid);
             }
@@ -506,7 +520,7 @@ class QueryTransformer {
 
             //Build grouping function in select item
             for (Expr groupingFunction : groupingFunctionCallExprs) {
-                grouping = columnRefFactory.create("GROUPING", Type.BIGINT, false);
+                grouping = columnRefFactory.create(GROUPING, Type.BIGINT, false);
 
                 ArrayList<BitSet> tempGroupingIdsBitSets = new ArrayList<>();
                 for (int i = 0; i < repeatColumnRefList.size(); ++i) {

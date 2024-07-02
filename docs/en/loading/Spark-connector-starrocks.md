@@ -196,6 +196,18 @@ Directly download the corresponding version of the Spark connector JAR from the 
 **Default value**:  \t<br/>
 **Description**:  The column separator for CSV-formatted data.
 
+### starrocks.write.properties.partial_update
+
+**Required**:  NO<br/>
+**Default value**: `FALSE`<br/>
+**Description**: Whether to use partial updates. Valid values: `TRUE` and `FALSE`. Default value: `FALSE`, indicating to disable this feature.
+
+### starrocks.write.properties.partial_update_mode
+
+**Required**:  NO<br/>
+**Default value**: `row`<br/>
+**Description**: Specifies the mode for partial updates. Valid values: `row` and `column`. <ul><li> The value `row` (default) means partial updates in row mode, which is more suitable for real-time updates with many columns and small batches.</li><li>The value `column` means partial updates in column mode, which is more suitable for batch updates with few columns and many rows. In such scenarios, enabling the column mode offers faster update speeds. For example, in a table with 100 columns, if only 10 columns (10% of the total) are updated for all rows, the update speed of the column mode is 10 times faster.</li></ul>
+
 ### starrocks.write.num.partitions
 
 **Required**:  NO<br/>
@@ -278,6 +290,10 @@ PRIMARY KEY(`id`)
 COMMENT "OLAP"
 DISTRIBUTED BY HASH(`id`);
 ```
+
+#### Network configuration
+
+Ensure that the machine where Spark is located can access the FE nodes of the StarRocks cluster via the [`http_port`](../administration/management/FE_configuration.md#http_port) (default: `8030`) and [`query_port`](../administration/management/FE_configuration.md#query_port) (default: `9030`), and the BE nodes via the [`be_http_port`](../administration/management/BE_configuration.md#be_http_port) (default: `8040`).
 
 #### Set up your Spark environment
 

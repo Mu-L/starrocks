@@ -31,10 +31,12 @@
 
 namespace starrocks {
 
+namespace {
 struct SlotDesc {
     string name;
     TypeDescriptor type;
 };
+} // namespace
 
 // TODO: partition scan
 class HdfsScannerTest : public ::testing::Test {
@@ -166,11 +168,10 @@ TupleDescriptor* HdfsScannerTest::_create_tuple_desc(SlotDesc* descs) {
     }
     tuple_desc_builder.build(&table_desc_builder);
     std::vector<TTupleId> row_tuples = std::vector<TTupleId>{0};
-    std::vector<bool> nullable_tuples = std::vector<bool>{true};
     DescriptorTbl* tbl = nullptr;
     CHECK(DescriptorTbl::create(_runtime_state, &_pool, table_desc_builder.desc_tbl(), &tbl, config::vector_chunk_size)
                   .ok());
-    auto* row_desc = _pool.add(new RowDescriptor(*tbl, row_tuples, nullable_tuples));
+    auto* row_desc = _pool.add(new RowDescriptor(*tbl, row_tuples));
     auto* tuple_desc = row_desc->tuple_descriptors()[0];
     return tuple_desc;
 }
@@ -209,6 +210,22 @@ TEST_F(HdfsScannerTest, TestParquetOpen) {
 
     status = scanner->open(_runtime_state);
     ASSERT_TRUE(status.ok());
+}
+
+TEST_F(HdfsScannerTest, TestHdfsRunningTime) {
+    auto scanner = std::make_shared<HdfsParquetScanner>();
+
+    auto* range = _create_scan_range(default_parquet_file, 4, 1024);
+    auto* tuple_desc = _create_tuple_desc(default_parquet_descs);
+    auto* param = _create_param(default_parquet_file, range, tuple_desc);
+
+    Status status = scanner->init(_runtime_state, *param);
+    ASSERT_TRUE(status.ok());
+
+    status = scanner->open(_runtime_state);
+    ASSERT_TRUE(status.ok());
+
+    ASSERT_TRUE(scanner->cpu_time_spent() > 0);
 }
 
 TEST_F(HdfsScannerTest, TestParquetGetNext) {
@@ -581,12 +598,11 @@ TEST_F(HdfsScannerTest, TestOrcGetNextWithMinMaxFilterNoRows) {
 
         tuple_desc_builder.build(&table_desc_builder);
         std::vector<TTupleId> row_tuples = std::vector<TTupleId>{0};
-        std::vector<bool> nullable_tuples = std::vector<bool>{true};
         DescriptorTbl* tbl = nullptr;
         CHECK(DescriptorTbl::create(_runtime_state, &_pool, table_desc_builder.desc_tbl(), &tbl,
                                     config::vector_chunk_size)
                       .ok());
-        auto* row_desc = _pool.add(new RowDescriptor(*tbl, row_tuples, nullable_tuples));
+        auto* row_desc = _pool.add(new RowDescriptor(*tbl, row_tuples));
         min_max_tuple_desc = row_desc->tuple_descriptors()[0];
     }
 
@@ -1719,6 +1735,56 @@ TEST_F(HdfsScannerTest, TestCSVCompressed) {
         scanner->close();
     }
     {
+        // compressed file with offset != 0
+        auto* range = _create_scan_range(compressed_file, 1, 0);
+        auto* tuple_desc = _create_tuple_desc(csv_descs);
+        auto* param = _create_param(compressed_file, range, tuple_desc);
+        build_hive_column_names(param, tuple_desc);
+        auto scanner = std::make_shared<HdfsTextScanner>();
+
+        status = scanner->init(_runtime_state, *param);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        status = scanner->open(_runtime_state);
+        ASSERT_TRUE(status.ok()) << status.message();
+        ASSERT_EQ(0, scanner->estimated_mem_usage());
+        scanner->close();
+    }
+    {
+        // compressed file with skip_header_line_count
+        auto* range = _create_scan_range(compressed_file, 0, 0);
+        range->text_file_desc.__set_skip_header_line_count(50);
+        auto* tuple_desc = _create_tuple_desc(csv_descs);
+        auto* param = _create_param(compressed_file, range, tuple_desc);
+        build_hive_column_names(param, tuple_desc);
+        auto scanner = std::make_shared<HdfsTextScanner>();
+
+        status = scanner->init(_runtime_state, *param);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        status = scanner->open(_runtime_state);
+        ASSERT_TRUE(status.ok()) << status.message();
+        READ_SCANNER_ROWS(scanner, 50);
+        scanner->close();
+    }
+    {
+        // compressed file with skip_header_line_count > total line count
+        auto* range = _create_scan_range(compressed_file, 0, 0);
+        range->text_file_desc.__set_skip_header_line_count(200);
+        auto* tuple_desc = _create_tuple_desc(csv_descs);
+        auto* param = _create_param(compressed_file, range, tuple_desc);
+        build_hive_column_names(param, tuple_desc);
+        auto scanner = std::make_shared<HdfsTextScanner>();
+
+        status = scanner->init(_runtime_state, *param);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        status = scanner->open(_runtime_state);
+        ASSERT_TRUE(status.ok()) << status.message();
+        READ_SCANNER_ROWS(scanner, 0);
+        scanner->close();
+    }
+    {
         auto* range = _create_scan_range(compressed_file, 0, 0);
         // Forcr to parse csv as uncompressed data.
         range->text_file_desc.__set_compression_type(TCompressionType::NO_COMPRESSION);
@@ -1968,6 +2034,56 @@ TEST_F(HdfsScannerTest, TestCSVWithUTFBOM) {
 
         EXPECT_EQ("['5c3ffda0d1d7']", chunk->debug_row(0));
         EXPECT_EQ("['62ef51eae5d8']", chunk->debug_row(1));
+        scanner->close();
+    }
+
+    {
+        // bom + skip 2 line
+        auto* range = _create_scan_range(bom_file, 0, 0);
+        range->text_file_desc.__set_skip_header_line_count(2);
+        auto* tuple_desc = _create_tuple_desc(csv_descs);
+        auto* param = _create_param(bom_file, range, tuple_desc);
+        build_hive_column_names(param, tuple_desc);
+        auto scanner = std::make_shared<HdfsTextScanner>();
+
+        status = scanner->init(_runtime_state, *param);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        status = scanner->open(_runtime_state);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        ChunkPtr chunk = ChunkHelper::new_chunk(*tuple_desc, 4096);
+
+        status = scanner->get_next(_runtime_state, &chunk);
+        EXPECT_TRUE(status.ok());
+        EXPECT_EQ(1, chunk->num_rows());
+
+        EXPECT_EQ("['6358db89e73b']", chunk->debug_row(0));
+        scanner->close();
+    }
+
+    {
+        // offset + bom + skip 1 line, but bom and skip_header_line_count will not take effect because of start offset != 0
+        auto* range = _create_scan_range(bom_file, 20, 0);
+        range->text_file_desc.__set_skip_header_line_count(1);
+        auto* tuple_desc = _create_tuple_desc(csv_descs);
+        auto* param = _create_param(bom_file, range, tuple_desc);
+        build_hive_column_names(param, tuple_desc);
+        auto scanner = std::make_shared<HdfsTextScanner>();
+
+        status = scanner->init(_runtime_state, *param);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        status = scanner->open(_runtime_state);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        ChunkPtr chunk = ChunkHelper::new_chunk(*tuple_desc, 4096);
+
+        status = scanner->get_next(_runtime_state, &chunk);
+        EXPECT_TRUE(status.ok());
+        EXPECT_EQ(2, chunk->num_rows());
+        EXPECT_EQ("['62ef51eae5d8']", chunk->debug_row(0));
+        EXPECT_EQ("['6358db89e73b']", chunk->debug_row(1));
         scanner->close();
     }
 }

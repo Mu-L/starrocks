@@ -48,14 +48,19 @@ import com.starrocks.analysis.BinaryPredicate;
 import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.DateLiteral;
 import com.starrocks.analysis.DecimalLiteral;
+import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.InPredicate;
 import com.starrocks.analysis.IsNullPredicate;
 import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.analysis.NullLiteral;
 import com.starrocks.analysis.Predicate;
 import com.starrocks.analysis.SlotRef;
+import com.starrocks.analysis.StringLiteral;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.ExpressionRangePartitionInfoV2;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.ListPartitionInfo;
 import com.starrocks.catalog.MaterializedIndex;
@@ -77,6 +82,7 @@ import com.starrocks.common.ErrorReport;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.common.util.DateUtils;
 import com.starrocks.common.util.ListComparator;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.common.util.concurrent.lock.LockType;
@@ -91,8 +97,10 @@ import com.starrocks.persist.metablock.SRMetaBlockReader;
 import com.starrocks.persist.metablock.SRMetaBlockWriter;
 import com.starrocks.planner.PartitionColumnFilter;
 import com.starrocks.planner.RangePartitionPruner;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.QueryStateException;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.service.FrontendOptions;
 import com.starrocks.sql.analyzer.DeleteAnalyzer;
 import com.starrocks.sql.ast.DeleteStmt;
@@ -100,6 +108,7 @@ import com.starrocks.transaction.RunningTxnExceedException;
 import com.starrocks.transaction.TransactionState;
 import com.starrocks.transaction.TransactionState.TxnCoordinator;
 import com.starrocks.transaction.TransactionState.TxnSourceType;
+import org.apache.commons.lang.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -108,6 +117,10 @@ import java.io.DataOutput;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.format.ResolverStyle;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -160,25 +173,24 @@ public class DeleteMgr implements Writable, MemoryTrackable {
 
     public void process(DeleteStmt stmt) throws DdlException, QueryStateException {
         String dbName = stmt.getTableName().getDb();
+        String tableName = stmt.getTableName().getTbl();
+
         Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
         if (db == null) {
             throw new DdlException("Db does not exist. name: " + dbName);
         }
 
+        Table table = db.getTable(tableName);
+        if (table == null) {
+            throw new DdlException("Table does not exist. name: " + tableName);
+        }
+
         DeleteJob deleteJob = null;
         try {
-            Table table = null;
-            long transactionId = -1L;
             List<Partition> partitions = Lists.newArrayList();
             Locker locker = new Locker();
-            locker.lockDatabase(db, LockType.READ);
+            locker.lockTablesWithIntensiveDbLock(db, Lists.newArrayList(table.getId()), LockType.READ);
             try {
-                String tableName = stmt.getTableName().getTbl();
-                table = db.getTable(tableName);
-                if (table == null) {
-                    throw new DdlException("Table does not exist. name: " + tableName);
-                }
-
                 if (!table.isOlapOrCloudNativeTable()) {
                     throw new DdlException("Delete is not supported on " + table.getType() + " table");
                 }
@@ -189,17 +201,17 @@ public class DeleteMgr implements Writable, MemoryTrackable {
                     return;
                 }
 
-                transactionId = deleteJob.getTransactionId();
             } catch (Throwable t) {
                 LOG.warn("error occurred during delete process", t);
                 // if transaction has been begun, need to abort it
-                if (GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().getTransactionState(db.getId(), transactionId) !=
-                        null) {
+                long transactionId = deleteJob == null ? -1 : deleteJob.getTransactionId();
+                if (GlobalStateMgr.getCurrentState().getGlobalTransactionMgr()
+                        .getTransactionState(db.getId(), transactionId) != null) {
                     cancelJob(deleteJob, CancelType.UNKNOWN, t.getMessage());
                 }
                 throw new DdlException(t.getMessage(), t);
             } finally {
-                locker.unLockDatabase(db, LockType.READ);
+                locker.unLockTablesWithIntensiveDbLock(db, Lists.newArrayList(table.getId()), LockType.READ);
             }
 
             deleteJob.run(stmt, db, table, partitions);
@@ -270,19 +282,27 @@ public class DeleteMgr implements Writable, MemoryTrackable {
         String label = "delete_" + UUID.randomUUID();
         long jobId = GlobalStateMgr.getCurrentState().getNextId();
         stmt.setJobId(jobId);
+
+        long warehouseId = WarehouseManager.DEFAULT_WAREHOUSE_ID;
+        if (ConnectContext.get() != null) {
+            warehouseId = ConnectContext.get().getCurrentWarehouseId();
+        }
+
         // begin txn here and generate txn id
         long transactionId = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().beginTransaction(db.getId(),
                 Lists.newArrayList(olapTable.getId()), label, null,
                 new TxnCoordinator(TxnSourceType.FE, FrontendOptions.getLocalHostAddress()),
-                TransactionState.LoadJobSourceType.DELETE, jobId, Config.stream_load_default_timeout_second);
+                TransactionState.LoadJobSourceType.DELETE, jobId, Config.stream_load_default_timeout_second,
+                warehouseId);
 
         MultiDeleteInfo deleteInfo =
                 new MultiDeleteInfo(db.getId(), olapTable.getId(), olapTable.getName(), deleteConditions);
         deleteInfo.setPartitions(noPartitionSpecified,
                 partitions.stream().map(Partition::getId).collect(Collectors.toList()), partitionNames);
         DeleteJob deleteJob = null;
+
         if (olapTable.isCloudNativeTable()) {
-            deleteJob = new LakeDeleteJob(jobId, transactionId, label, deleteInfo);
+            deleteJob = new LakeDeleteJob(jobId, transactionId, label, deleteInfo, warehouseId);
         } else {
             deleteJob = new OlapDeleteJob(jobId, transactionId, label, partitionReplicaNum, deleteInfo);
         }
@@ -307,13 +327,13 @@ public class DeleteMgr implements Writable, MemoryTrackable {
         PartitionInfo partitionInfo = olapTable.getPartitionInfo();
         RangePartitionInfo rangePartitionInfo = (RangePartitionInfo) partitionInfo;
         Map<String, PartitionColumnFilter> columnFilters = extractColumnFilter(olapTable,
-                rangePartitionInfo.getPartitionColumns(), conditions);
+                rangePartitionInfo, conditions);
         Map<Long, Range<PartitionKey>> keyRangeById = rangePartitionInfo.getIdToRange(false);
         if (columnFilters.isEmpty()) {
             partitionNames.addAll(olapTable.getPartitionNames());
         } else {
             RangePartitionPruner pruner = new RangePartitionPruner(keyRangeById,
-                    rangePartitionInfo.getPartitionColumns(), columnFilters);
+                    rangePartitionInfo.getPartitionColumns(olapTable.getIdToColumn()), columnFilters);
             Collection<Long> selectedPartitionIds = pruner.prune();
 
             if (selectedPartitionIds == null) {
@@ -328,10 +348,11 @@ public class DeleteMgr implements Writable, MemoryTrackable {
         return partitionNames;
     }
 
-    private Map<String, PartitionColumnFilter> extractColumnFilter(Table table, List<Column> partitionColumns,
+    private Map<String, PartitionColumnFilter> extractColumnFilter(Table table, RangePartitionInfo rangePartitionInfo,
                                                                    List<Predicate> conditions)
             throws DdlException, AnalysisException {
         Map<String, PartitionColumnFilter> columnFilters = Maps.newHashMap();
+        List<Column> partitionColumns = rangePartitionInfo.getPartitionColumns(table.getIdToColumn());
         List<Predicate> deleteConditions = conditions;
         Map<String, Column> nameToColumn = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
         for (Column column : table.getBaseSchema()) {
@@ -353,8 +374,35 @@ public class DeleteMgr implements Writable, MemoryTrackable {
                 BinaryPredicate binaryPredicate = (BinaryPredicate) condition;
                 LiteralExpr literalExpr = (LiteralExpr) binaryPredicate.getChild(1);
                 Column column = nameToColumn.get(columnName);
-                literalExpr = LiteralExpr.create(literalExpr.getStringValue(),
-                        Objects.requireNonNull(Type.fromPrimitiveType(column.getPrimitiveType())));
+
+                if (table.isExprPartitionTable() && !rangePartitionInfo.isAutomaticPartition()) {
+                    ExpressionRangePartitionInfoV2 expressionRangePartitionInfoV2 =
+                            (ExpressionRangePartitionInfoV2) rangePartitionInfo;
+                    Expr partitionExpr = expressionRangePartitionInfoV2.getPartitionExprs(table.getIdToColumn()).get(0);
+                    List<FunctionCallExpr> functionCallExprs = new ArrayList<>();
+                    partitionExpr.collect((com.google.common.base.Predicate<Expr>) arg -> arg instanceof FunctionCallExpr,
+                            functionCallExprs);
+                    FunctionCallExpr functionCallExpr = functionCallExprs.get(0);
+                    String funcName = functionCallExpr.getFnName().getFunction();
+                    if (funcName.equalsIgnoreCase(FunctionSet.STR2DATE)) {
+                        String format = ((StringLiteral) functionCallExpr.getChild(1)).getValue();
+                        DateTimeFormatterBuilder builder = DateUtils.unixDatetimeFormatBuilder(format, false);
+                        LocalDate ld = LocalDate.from(builder.toFormatter().withResolverStyle(ResolverStyle.STRICT).parse(
+                                StringUtils.strip(literalExpr.getStringValue(), "\r\n\t ")));
+                        literalExpr = new DateLiteral(ld.atTime(0, 0, 0), Type.DATE);
+                    } else if (funcName.equalsIgnoreCase(FunctionSet.FROM_UNIXTIME)) {
+                        literalExpr = LiteralExpr.create(DateUtils.formatTimestampInSeconds(
+                                Long.parseLong(literalExpr.getStringValue())), Type.DATETIME);
+                    } else if (funcName.equalsIgnoreCase(FunctionSet.FROM_UNIXTIME_MS)) {
+                        literalExpr = LiteralExpr.create(DateUtils.formatTimeStampInMill(
+                                        Long.parseLong(literalExpr.getStringValue()), TimeUtils.getSystemTimeZone().toZoneId()),
+                                Type.DATETIME);
+                    }
+                } else {
+                    literalExpr = LiteralExpr.create(literalExpr.getStringValue(),
+                            Objects.requireNonNull(Type.fromPrimitiveType(column.getPrimitiveType())));
+                }
+
                 PartitionColumnFilter filter = columnFilters.getOrDefault(slotRef.getColumnName(),
                         new PartitionColumnFilter());
                 switch (binaryPredicate.getOp()) {
@@ -562,7 +610,7 @@ public class DeleteMgr implements Writable, MemoryTrackable {
             }
 
             // set schema column name
-            slotRef.setCol(column.getName());
+            slotRef.setColumnName(column.getName());
         }
         // check materialized index.
         // only need check the first partition because each partition has same materialized view
@@ -873,7 +921,7 @@ public class DeleteMgr implements Writable, MemoryTrackable {
             count += value.size();
         }
         return ImmutableMap.of("DeleteInfo", getDeleteInfoCount(),
-                               "DeleteJob", (long) idToDeleteJob.size());
+                "DeleteJob", (long) idToDeleteJob.size());
     }
 
 }

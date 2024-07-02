@@ -63,7 +63,6 @@ import com.starrocks.thrift.THeartbeatResult;
 import com.starrocks.thrift.TMasterInfo;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TStatusCode;
-import com.starrocks.warehouse.Warehouse;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.json.JSONObject;
@@ -141,6 +140,7 @@ public class HeartbeatMgr extends FrontendDaemon {
                 masterFeNodeName = frontend.getNodeName();
             }
             FrontendHeartbeatHandler handler = new FrontendHeartbeatHandler(frontend,
+                    GlobalStateMgr.getCurrentState().getNodeMgr().getClusterId(),
                     GlobalStateMgr.getCurrentState().getNodeMgr().getToken());
             hbResponses.add(executor.submit(handler));
         }
@@ -227,14 +227,11 @@ public class HeartbeatMgr extends FrontendDaemon {
                             // addWorker
                             int starletPort = computeNode.getStarletPort();
                             if (starletPort != 0) {
-                                Warehouse warehouse = GlobalStateMgr.getCurrentState().getWarehouseMgr().
-                                        getDefaultWarehouse();
-                                long workerGroupId = warehouse.getAnyAvailableCluster().getWorkerGroupId();
-                                String workerAddr = NetUtils.getHostPortInAccessibleFormat(computeNode.getHost(), 
+                                String workerAddr = NetUtils.getHostPortInAccessibleFormat(computeNode.getHost(),
                                         starletPort);
 
                                 GlobalStateMgr.getCurrentState().getStarOSAgent().
-                                        addWorker(computeNode.getId(), workerAddr, workerGroupId);
+                                        addWorker(computeNode.getId(), workerAddr, computeNode.getWorkerGroupId());
                             }
                         }
                     }
@@ -318,11 +315,12 @@ public class HeartbeatMgr extends FrontendDaemon {
                     // Update number of hardware of cores of corresponding backend.
                     // BackendCoreStat will be updated in ComputeNode.handleHbResponse.
                     int cpuCores = tBackendInfo.isSetNum_hardware_cores() ? tBackendInfo.getNum_hardware_cores() : 0;
+                    long memLimitBytes = tBackendInfo.isSetMem_limit_bytes() ? tBackendInfo.getMem_limit_bytes() : 0;
 
                     // backend.updateOnce(bePort, httpPort, beRpcPort, brpcPort);
                     BackendHbResponse backendHbResponse = new BackendHbResponse(
                             computeNodeId, bePort, httpPort, brpcPort, starletPort,
-                            System.currentTimeMillis(), version, cpuCores, isSetStoragePath);
+                            System.currentTimeMillis(), version, cpuCores, memLimitBytes, isSetStoragePath);
                     if (tBackendInfo.isSetReboot_time()) {
                         backendHbResponse.setRebootTime(tBackendInfo.getReboot_time());
                     }
@@ -350,10 +348,12 @@ public class HeartbeatMgr extends FrontendDaemon {
     // frontend heartbeat
     public static class FrontendHeartbeatHandler implements Callable<HeartbeatResponse> {
         private final Frontend fe;
+        private final int clusterId;
         private final String token;
 
-        public FrontendHeartbeatHandler(Frontend fe, String token) {
+        public FrontendHeartbeatHandler(Frontend fe, int clusterId, String token) {
             this.fe = fe;
+            this.clusterId = clusterId;
             this.token = token;
         }
 
@@ -371,10 +371,9 @@ public class HeartbeatMgr extends FrontendDaemon {
                 }
             }
 
-
             String accessibleHostPort = NetUtils.getHostPortInAccessibleFormat(fe.getHost(), Config.http_port);
             String url = "http://" + accessibleHostPort
-                    + "/api/bootstrap?token=" + token;
+                    + "/api/bootstrap?cluster_id=" + clusterId + "&token=" + token;
             try {
                 String result = Util.getResultForUrl(url, null,
                         Config.heartbeat_timeout_second * 1000, Config.heartbeat_timeout_second * 1000);

@@ -35,6 +35,7 @@ import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.RecyclePartitionInfo;
 import com.starrocks.catalog.TableIndexes;
 import com.starrocks.catalog.TableProperty;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.io.DeepCopy;
 import com.starrocks.common.io.Text;
@@ -46,7 +47,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -111,13 +111,6 @@ public class LakeTable extends OlapTable {
         // type is already read in Table
         String json = Text.readString(in);
         return GsonUtils.GSON.fromJson(json, LakeTable.class);
-    }
-
-    @Override
-    public void write(DataOutput out) throws IOException {
-        // write type first
-        Text.writeString(out, type.name());
-        Text.writeString(out, GsonUtils.GSON.toJson(this));
     }
 
     @Override
@@ -188,9 +181,10 @@ public class LakeTable extends OlapTable {
         List<Long> shardIds = null;
         try {
             // Ignore the parameter replicationNum
-            shardIds = globalStateMgr.getStarOSAgent().createShards(tabletNum, fsInfo, cacheInfo, shardGroupId, properties);
+            shardIds = globalStateMgr.getStarOSAgent().createShards(tabletNum, fsInfo, cacheInfo, shardGroupId, null, properties,
+                    StarOSAgent.DEFAULT_WORKER_GROUP_ID);
         } catch (DdlException e) {
-            LOG.error(e.getMessage());
+            LOG.error(e.getMessage(), e);
             return new Status(Status.ErrCode.COMMON_ERROR, e.getMessage());
         }
         for (long shardId : shardIds) {
@@ -256,5 +250,10 @@ public class LakeTable extends OlapTable {
         if (getMaxColUniqueId() <= 0) {
             setMaxColUniqueId(LakeTableHelper.restoreColumnUniqueId(this));
         }
+    }
+
+    @Override
+    public boolean getUseFastSchemaEvolution() {
+        return !hasRowStorageType() && Config.enable_fast_schema_evolution_in_share_data_mode;
     }
 }

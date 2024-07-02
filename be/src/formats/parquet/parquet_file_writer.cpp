@@ -14,40 +14,48 @@
 
 #include "formats/parquet/parquet_file_writer.h"
 
-#include <arrow/buffer.h>
-#include <arrow/io/file.h>
-#include <parquet/arrow/writer.h>
+#include <fmt/core.h>
+#include <glog/logging.h>
+#include <parquet/exception.h>
+#include <parquet/file_writer.h>
+#include <parquet/metadata.h>
+#include <parquet/parquet_version.h>
+#include <parquet/properties.h>
+#include <parquet/statistics.h>
 #include <runtime/current_thread.h>
 
 #include <future>
+#include <ostream>
+#include <utility>
 
-#include "column/array_column.h"
-#include "column/chunk.h"
-#include "column/column_helper.h"
-#include "column/map_column.h"
-#include "column/struct_column.h"
 #include "column/vectorized_fwd.h"
-#include "common/logging.h"
-#include "exprs/expr.h"
 #include "formats/file_writer.h"
+#include "formats/parquet/chunk_writer.h"
+#include "formats/parquet/file_writer.h"
+#include "formats/parquet/utils.h"
 #include "formats/utils.h"
-#include "runtime/exec_env.h"
-#include "util/defer_op.h"
+#include "fs/fs.h"
+#include "runtime/runtime_state.h"
+#include "types/logical_type.h"
+#include "util/debug_util.h"
 #include "util/priority_thread_pool.hpp"
-#include "util/runtime_profile.h"
-#include "util/slice.h"
+
+namespace starrocks {
+class Chunk;
+} // namespace starrocks
 
 namespace starrocks::formats {
 
 std::future<Status> ParquetFileWriter::write(ChunkPtr chunk) {
     if (_rowgroup_writer == nullptr) {
-        _rowgroup_writer = std::make_unique<parquet::ChunkWriter>(_writer->AppendBufferedRowGroup(), _type_descs,
-                                                                  _schema, _eval_func);
+        _rowgroup_writer = std::make_unique<parquet::ChunkWriter>(
+                _writer->AppendBufferedRowGroup(), _type_descs, _schema, _eval_func, _writer_options->time_zone,
+                _writer_options->use_legacy_decimal_encoding, _writer_options->use_int96_timestamp_encoding);
     }
     if (auto status = _rowgroup_writer->write(chunk.get()); !status.ok()) {
         return make_ready_future(std::move(status));
     }
-    if (_rowgroup_writer->estimated_buffered_bytes() > _writer_options->rowgroup_size) {
+    if (_rowgroup_writer->estimated_buffered_bytes() >= _writer_options->rowgroup_size) {
         return _flush_row_group();
     }
     return make_ready_future(Status::OK());
@@ -59,10 +67,18 @@ std::future<FileWriter::CommitResult> ParquetFileWriter::commit() {
 
     auto task = [writer = _writer, output_stream = _output_stream, p = promise,
                  has_field_id = _writer_options->column_ids.has_value(), rollback = _rollback_action,
-                 location = _location, state = _runtime_state] {
+                 location = _location, state = _runtime_state, execution_state = _execution_state] {
 #ifndef BE_TEST
         SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(state->instance_mem_tracker());
+        CurrentThread::current().set_query_id(state->query_id());
+        CurrentThread::current().set_fragment_instance_id(state->fragment_instance_id());
 #endif
+        {
+            // commit until all rowgroup flushing tasks have been done
+            std::unique_lock lock(execution_state->mu);
+            execution_state->cv.wait(lock, [&]() { return !execution_state->has_unfinished_task; });
+        }
+
         FileWriter::CommitResult result{
                 .io_status = Status::OK(), .format = PARQUET, .location = location, .rollback_action = rollback};
         try {
@@ -112,20 +128,33 @@ std::future<Status> ParquetFileWriter::_flush_row_group() {
     auto promise = std::make_shared<std::promise<Status>>();
     std::future<Status> future = promise->get_future();
 
-    auto task = [rowgroup_writer = _rowgroup_writer, p = promise, state = _runtime_state] {
+    auto task = [rowgroup_writer = _rowgroup_writer, p = promise, state = _runtime_state,
+                 execution_state = _execution_state] {
 #ifndef BE_TEST
         SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(state->instance_mem_tracker());
+        CurrentThread::current().set_query_id(state->query_id());
+        CurrentThread::current().set_fragment_instance_id(state->fragment_instance_id());
 #endif
         try {
             rowgroup_writer->close();
+            p->set_value(Status::OK());
         } catch (const ::parquet::ParquetStatusException& e) {
             Status exception = Status::IOError(fmt::format("{}: {}", "flush rowgroup error", e.what()));
             LOG(WARNING) << exception;
             p->set_value(exception);
-            return;
         }
-        p->set_value(Status::OK());
+
+        {
+            std::lock_guard lock(execution_state->mu);
+            execution_state->has_unfinished_task = false;
+            execution_state->cv.notify_one();
+        }
     };
+
+    {
+        std::lock_guard lock(_execution_state->mu);
+        _execution_state->has_unfinished_task = true;
+    }
 
     if (_executors) {
         bool ok = _executors->try_offer(task);
@@ -250,7 +279,7 @@ ParquetFileWriter::ParquetFileWriter(
         const std::string& location, std::unique_ptr<parquet::ParquetOutputStream> output_stream,
         const std::vector<std::string>& column_names, const std::vector<TypeDescriptor>& type_descs,
         std::vector<std::unique_ptr<ColumnEvaluator>>&& column_evaluators, TCompressionType::type compression_type,
-        const std::shared_ptr<ParquetWriterOptions>& writer_options, const std::function<void()> rollback_action,
+        const std::shared_ptr<ParquetWriterOptions>& writer_options, const std::function<void()>& rollback_action,
         PriorityThreadPool* executors, RuntimeState* runtime_state)
         : _location(location),
           _output_stream(std::move(output_stream)),
@@ -283,11 +312,11 @@ StatusOr<::parquet::Compression::type> ParquetFileWriter::_convert_compression_t
         break;
     }
     case TCompressionType::LZ4: {
-        converted_type = ::parquet::Compression::LZ4;
+        converted_type = ::parquet::Compression::LZ4_HADOOP;
         break;
     }
     default: {
-        return Status::NotSupported(fmt::format("not supported compression type {}", type));
+        return Status::NotSupported(fmt::format("not supported compression type {}", to_string(type)));
     }
     }
 
@@ -300,7 +329,7 @@ StatusOr<::parquet::Compression::type> ParquetFileWriter::_convert_compression_t
 }
 
 arrow::Result<std::shared_ptr<::parquet::schema::GroupNode>> ParquetFileWriter::_make_schema(
-        const vector<std::string>& column_names, const vector<TypeDescriptor>& type_descs,
+        const std::vector<std::string>& column_names, const std::vector<TypeDescriptor>& type_descs,
         const std::vector<FileColumnId>& file_column_ids) {
     ::parquet::schema::NodeVector fields;
     for (int i = 0; i < type_descs.size(); i++) {
@@ -364,27 +393,37 @@ arrow::Result<::parquet::schema::NodePtr> ParquetFileWriter::_make_schema_node(c
                                                       ::parquet::Type::INT32, -1, file_column_id.field_id);
     }
     case TYPE_DATETIME: {
-        // TODO(letian-jiang): set isAdjustedToUTC to true, and normalize datetime values
-        return ::parquet::schema::PrimitiveNode::Make(
-                name, rep_type,
-                ::parquet::LogicalType::Timestamp(false, ::parquet::LogicalType::TimeUnit::unit::MILLIS),
-                ::parquet::Type::INT64, -1, file_column_id.field_id);
+        // Apache Hive version 3 or lower does not support reading timestamps encoded as INT64
+        if (_writer_options->use_int96_timestamp_encoding) {
+            return ::parquet::schema::PrimitiveNode::Make(name, rep_type, ::parquet::Type::INT96,
+                                                          ::parquet::ConvertedType::NONE, -1, file_column_id.field_id);
+        } else {
+            return ::parquet::schema::PrimitiveNode::Make(
+                    name, rep_type,
+                    ::parquet::LogicalType::Timestamp(true, ::parquet::LogicalType::TimeUnit::unit::MICROS),
+                    ::parquet::Type::INT64, -1, file_column_id.field_id);
+        }
     }
-    case TYPE_DECIMAL32: {
-        return ::parquet::schema::PrimitiveNode::Make(
-                name, rep_type, ::parquet::LogicalType::Decimal(type_desc.precision, type_desc.scale),
-                ::parquet::Type::INT32, -1, file_column_id.field_id);
-    }
-
-    case TYPE_DECIMAL64: {
-        return ::parquet::schema::PrimitiveNode::Make(
-                name, rep_type, ::parquet::LogicalType::Decimal(type_desc.precision, type_desc.scale),
-                ::parquet::Type::INT64, -1, file_column_id.field_id);
-    }
+    case TYPE_DECIMAL32:
+    case TYPE_DECIMAL64:
     case TYPE_DECIMAL128: {
+        // Apache Hive version 3 or lower does not support reading decimals encoded as INT32/INT64
+        if (!_writer_options->use_legacy_decimal_encoding) {
+            if (type_desc.type == TYPE_DECIMAL32) {
+                return ::parquet::schema::PrimitiveNode::Make(
+                        name, rep_type, ::parquet::LogicalType::Decimal(type_desc.precision, type_desc.scale),
+                        ::parquet::Type::INT32, -1, file_column_id.field_id);
+            }
+            if (type_desc.type == TYPE_DECIMAL64) {
+                return ::parquet::schema::PrimitiveNode::Make(
+                        name, rep_type, ::parquet::LogicalType::Decimal(type_desc.precision, type_desc.scale),
+                        ::parquet::Type::INT64, -1, file_column_id.field_id);
+            }
+        }
         return ::parquet::schema::PrimitiveNode::Make(
                 name, rep_type, ::parquet::LogicalType::Decimal(type_desc.precision, type_desc.scale),
-                ::parquet::Type::FIXED_LEN_BYTE_ARRAY, 16, file_column_id.field_id);
+                ::parquet::Type::FIXED_LEN_BYTE_ARRAY, parquet::decimal_precision_to_byte_count(type_desc.precision),
+                file_column_id.field_id);
     }
     case TYPE_STRUCT: {
         DCHECK(type_desc.children.size() == type_desc.field_names.size());
@@ -452,10 +491,13 @@ Status ParquetFileWriter::init() {
 
     ASSIGN_OR_RETURN(auto compression, _convert_compression_type(_compression_type));
     _properties = std::make_unique<::parquet::WriterProperties::Builder>()
+                          ->version(::parquet::ParquetVersion::PARQUET_2_6)
+                          ->enable_write_page_index()
                           ->data_pagesize(_writer_options->page_size)
                           ->write_batch_size(_writer_options->write_batch_size)
                           ->dictionary_pagesize_limit(_writer_options->dictionary_pagesize)
                           ->compression(compression)
+                          ->created_by(fmt::format("{} starrocks-{}", CREATED_BY_VERSION, get_short_version()))
                           ->build();
 
     _writer = ::parquet::ParquetFileWriter::Open(_output_stream, _schema, _properties);
@@ -473,7 +515,7 @@ ParquetFileWriterFactory::ParquetFileWriterFactory(std::shared_ptr<FileSystem> f
                                                    PriorityThreadPool* executors, RuntimeState* runtime_state)
         : _fs(std::move(fs)),
           _compression_type(compression_type),
-          _field_ids(field_ids),
+          _field_ids(std::move(field_ids)),
           _options(options),
           _column_names(column_names),
           _column_evaluators(std::move(column_evaluators)),
@@ -484,10 +526,21 @@ Status ParquetFileWriterFactory::init() {
     RETURN_IF_ERROR(ColumnEvaluator::init(_column_evaluators));
     _parsed_options = std::make_shared<ParquetWriterOptions>();
     _parsed_options->column_ids = _field_ids;
+    if (_options.contains(ParquetWriterOptions::USE_LEGACY_DECIMAL_ENCODING)) {
+        _parsed_options->use_legacy_decimal_encoding =
+                boost::iequals(_options[ParquetWriterOptions::USE_LEGACY_DECIMAL_ENCODING], "true");
+    }
+    if (_options.contains(ParquetWriterOptions::USE_INT96_TIMESTAMP_ENCODING)) {
+        _parsed_options->use_int96_timestamp_encoding =
+                boost::iequals(_options[ParquetWriterOptions::USE_INT96_TIMESTAMP_ENCODING], "true");
+    }
+#ifndef BE_TEST
+    _parsed_options->time_zone = _runtime_state->timezone();
+#endif
     return Status::OK();
 }
 
-StatusOr<std::shared_ptr<FileWriter>> ParquetFileWriterFactory::create(const std::string& path) {
+StatusOr<std::shared_ptr<FileWriter>> ParquetFileWriterFactory::create(const std::string& path) const {
     ASSIGN_OR_RETURN(auto file, _fs->new_writable_file(path));
     auto rollback_action = [fs = _fs, path = path]() {
         WARN_IF_ERROR(ignore_not_found(fs->delete_file(path)), "fail to delete file");

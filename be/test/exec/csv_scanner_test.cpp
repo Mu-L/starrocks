@@ -196,6 +196,9 @@ TEST_P(CSVScannerTest, test_scalar_types) {
     EXPECT_EQ(true, chunk->get(2)[4].is_null());
     // len(oranges) == 7 > 6
     EXPECT_EQ(true, chunk->get(3)[4].is_null());
+
+    ASSERT_GT(scanner->TEST_scanner_counter()->file_read_count, 0);
+    ASSERT_GT(scanner->TEST_scanner_counter()->file_read_ns, 0);
 }
 
 TEST_P(CSVScannerTest, test_adaptive_nullable_column1) {
@@ -1060,7 +1063,7 @@ TEST_P(CSVScannerTest, test_column_count_inconsistent) {
     std::string line;
     line.resize(1024);
     rfile.getline(line.data(), line.size());
-    auto found = line.find("Value count does not match column count: expected = 4, actual = 5");
+    auto found = line.find("Target column count: 4 doesn't match source value column count: 5");
     ASSERT_TRUE(found != std::string::npos);
     rfile.close();
 
